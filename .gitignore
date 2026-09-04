@@ -1,0 +1,29 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+coverage.out
+
+# Runtime state and logs
+*.sock
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
+
+# Temporary and editor files
+*.tmp
+*~
+.DS_Store
+.idea/
+.vscode/
+*.swp
