@@ -46,6 +46,7 @@ linters-settings:
       - definitivo
       - exponencial
       - adquire
+      - argumentos
 
 issues:
   exclude-use-default: false

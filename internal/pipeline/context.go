@@ -128,10 +128,19 @@ func ClassifyError(err error, res *providers.StepResult) ErrorCategory {
 			"connection refused",
 			"network is unreachable",
 			"i/o timeout",
+			"operation timed out",
 			"temporary failure in name resolution",
 			"could not resolve host",
+			"could not connect to",
+			"failed to connect to",
+			"unable to access",
 			"resource temporarily unavailable",
 			"the remote end hung up unexpectedly",
+			"tls handshake",
+			"ssl_error",
+			"non-fast-forward",
+			"[rejected]",
+			"fetch first",
 		}
 		for _, indicator := range transientIndicators {
 			if strings.Contains(errLower, indicator) {

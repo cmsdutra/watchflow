@@ -23,6 +23,7 @@ func init() {
 	_ = providers.Register(&LockCheckerAction{})
 	_ = providers.Register(&AddAction{})
 	_ = providers.Register(&CommitAction{})
+	_ = providers.Register(&PushAction{})
 }
 
 // Register registra todas as ações do provedor Git no catálogo especificado.
@@ -36,7 +37,10 @@ func Register(reg *providers.Registry) error {
 	if err := reg.Register(&CommitAction{}); err != nil {
 		return err
 	}
-	return reg.Register(&SafeSyncAction{})
+	if err := reg.Register(&SafeSyncAction{}); err != nil {
+		return err
+	}
+	return reg.Register(&PushAction{})
 }
 
 // AddAction implementa a action 'git.add', adicionando alterações locais ao stage.
