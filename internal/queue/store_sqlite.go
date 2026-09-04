@@ -394,11 +394,19 @@ func (s *Store) ListPendingJobs(watcherID string) ([]*Job, error) {
 	return jobs, rows.Err()
 }
 
-// ResetRunningJobs reverte jobs presos em RUNNING (ex.: após crash de energia) para PENDING.
+// ResetRunningJobs reverte jobs presos em RUNNING (ex.: após crash de energia) para PENDING ou FAILED se esgotar tentativas.
 func (s *Store) ResetRunningJobs() (int64, error) {
 	query := `
 	UPDATE jobs
-	SET status = 'PENDING', locked_by = NULL, locked_at = NULL, updated_at = CURRENT_TIMESTAMP
+	SET status = CASE
+			WHEN retry_count + 1 >= max_retries THEN 'FAILED'
+			ELSE 'PENDING'
+		END,
+		retry_count = retry_count + 1,
+		locked_by = NULL,
+		locked_at = NULL,
+		last_error = 'daemon reiniciado durante execução anterior (recuperado pós-crash)',
+		updated_at = CURRENT_TIMESTAMP
 	WHERE status = 'RUNNING';
 	`
 	res, err := s.db.Exec(query)
