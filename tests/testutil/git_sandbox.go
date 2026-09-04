@@ -42,6 +42,45 @@ func NewGitSandbox(t testing.TB) *GitSandbox {
 	return sb
 }
 
+// NewBareRepo cria um repositório Git bare (central/remote) para testes de sincronização.
+func NewBareRepo(t testing.TB) string {
+	t.Helper()
+	dir := t.TempDir()
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err == nil {
+		dir = realDir
+	}
+	cmd := exec.Command("git", "init", "--bare", "-b", "main")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("falha ao inicializar bare repo: %v (%s)", err, string(out))
+	}
+	return dir
+}
+
+// CloneRepo clona um repositório fonte para um novo diretório temporário isolado.
+func CloneRepo(t testing.TB, source string) *GitSandbox {
+	t.Helper()
+	dir := t.TempDir()
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err == nil {
+		dir = realDir
+	}
+	cmd := exec.Command("git", "clone", source, dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("falha ao clonar repo '%s': %v (%s)", source, err, string(out))
+	}
+	sb := &GitSandbox{
+		T:       t,
+		RootDir: dir,
+	}
+	sb.MustRunGit("config", "user.name", "WatchFlow Tester")
+	sb.MustRunGit("config", "user.email", "tester@watchflow.local")
+	sb.MustRunGit("config", "commit.gpgsign", "false")
+	sb.MustRunGit("config", "core.autocrlf", "false")
+	return sb
+}
+
 // WriteFile cria ou sobrescreve um arquivo dentro do sandbox.
 func (s *GitSandbox) WriteFile(relPath, content string) string {
 	s.T.Helper()

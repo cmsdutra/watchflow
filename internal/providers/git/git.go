@@ -33,7 +33,10 @@ func Register(reg *providers.Registry) error {
 	if err := reg.Register(&AddAction{}); err != nil {
 		return err
 	}
-	return reg.Register(&CommitAction{})
+	if err := reg.Register(&CommitAction{}); err != nil {
+		return err
+	}
+	return reg.Register(&SafeSyncAction{})
 }
 
 // AddAction implementa a action 'git.add', adicionando alterações locais ao stage.
