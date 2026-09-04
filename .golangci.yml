@@ -49,6 +49,7 @@ linters-settings:
       - argumentos
       - supressão
       - supress
+      - respondendo
 
 issues:
   exclude-use-default: false

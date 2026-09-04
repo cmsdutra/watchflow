@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/watchflow/watchflow/internal/config"
 )
 
 var (
@@ -13,6 +16,8 @@ var (
 	version = "0.1.0-dev"
 	commit  = "none"
 	date    = "unknown"
+
+	socketFlag string
 
 	rootCmd = &cobra.Command{
 		Use:   "watchflow",
@@ -35,6 +40,7 @@ vaults de conhecimento e diretórios locais via Git e outros provedores.`,
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "Caminho para o arquivo de configuração (padrão ~/.config/watchflow/config.yaml)")
+	rootCmd.PersistentFlags().StringVar(&socketFlag, "socket", "", "Caminho alternativo para o socket Unix do daemon")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Habilita saída de log detalhada em modo debug")
 
 	rootCmd.AddCommand(versionCmd)
@@ -43,4 +49,31 @@ func init() {
 // Execute starts the WatchFlow command-line interface execution.
 func Execute() error {
 	return rootCmd.Execute()
+}
+
+func resolveSocketPath() string {
+	if socketFlag != "" {
+		return config.ExpandPath(socketFlag)
+	}
+
+	cfgPath := cfgFile
+	if cfgPath == "" {
+		cfgPath = config.DefaultConfigPath()
+	}
+
+	if cfg, err := config.Load(cfgPath); err == nil && cfg.Daemon.SocketPath != "" {
+		return config.ExpandPath(cfg.Daemon.SocketPath)
+	}
+
+	uid := os.Getuid()
+	runUser := fmt.Sprintf("/run/user/%d", uid)
+	if fi, err := os.Stat(runUser); err == nil && fi.IsDir() {
+		return filepath.Join(runUser, "watchflow.sock")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".watchflow.sock"
+	}
+	return filepath.Join(home, ".local", "state", "watchflow", "watchflow.sock")
 }
