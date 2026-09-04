@@ -1,0 +1,94 @@
+# ==============================================================================
+# WatchFlow — Exemplo Canônico de Configuração
+# ==============================================================================
+# Versão do esquema de configuração (atualmente: 1)
+version: 1
+
+# Parâmetros gerais do daemon de segundo plano
+daemon:
+  # Diretório onde serão armazenados o banco SQLite (state.db) e logs
+  state_dir: "~/.local/state/watchflow"
+
+  # Caminho para o Unix Domain Socket de controle da CLI
+  # ${UID} é expandido automaticamente para o UID do usuário corrente
+  socket_path: "/run/user/${UID}/watchflow.sock"
+
+  # Nível de detalhamento dos logs estruturados: debug, info, warn, error
+  log_level: "info"
+
+  # Quantidade máxima de pipelines executando em paralelo em repositórios distintos
+  max_concurrent_pipelines: 2
+
+# Configuração de alertas e notificações do sistema operacional
+notifications:
+  enabled: true
+  on_success: false   # Evita notificações ruidosas em execuções normais
+  on_error: true      # Alerta em erros de conexão ou falhas de step
+  on_conflict: true   # Alerta desktop obrigatório se houver colisão de merge
+  backend: "desktop"  # desktop (notify-send), log, webhook
+
+# Diretórios raízes vigiados pelo daemon
+watchers:
+  - name: "personal-vault"
+    # Caminho absoluto ou com '~' para o diretório observado (ex.: cofre do Obsidian)
+    path: "~/Chaos"
+    enabled: true
+
+    # Janela deslizante de silêncio para coalescer rajadas de escrita (trailing debounce)
+    debounce: "15s"
+
+    # Teto máximo absoluto de espera: força o despacho mesmo se houver escrita contínua
+    max_wait: "60s"
+
+    # Padrões glob de caminhos a serem descartados imediatamente (< 1ms)
+    ignore:
+      - ".git/**"
+      - ".obsidian/cache/**"
+      - ".obsidian/workspace*"
+      - "**/*.tmp"
+      - "**/.DS_Store"
+      - ".tmp/**"
+
+    # Pipelines a serem disparados quando houver lote consolidado de alterações
+    pipelines:
+      - "vault-git-sync"
+
+# Declaração dos pipelines e seus passos sequenciais
+pipelines:
+  vault-git-sync:
+    # Tempo limite máximo para conclusão de toda a sequência antes de abortar
+    timeout: "120s"
+
+    # Passos executados linearmente (interrompe imediatamente se algum passo falhar)
+    steps:
+      # Step 1: Verifica e aguarda travas externas alheias (.git/index.lock)
+      - action: "git.check_locks"
+        params:
+          max_wait_lock: "10s"
+
+      # Step 2: Adiciona todas as modificações reais da árvore de trabalho
+      - action: "git.add"
+        params:
+          all: true
+
+      # Step 3: Cria commit local (não cria se a árvore estiver limpa / no-op)
+      - action: "git.commit"
+        params:
+          message: "watchflow: auto-sync {{timestamp}}"
+          allow_empty: false
+
+      # Step 4: Protocolo Safe Git Sync: fetch, inspeciona divergência e aplica merge limpo.
+      # Se houver qualquer conflito de linhas, executa git merge --abort imediatamente.
+      - action: "git.safe_sync"
+        params:
+          remote: "origin"
+          branch: "master"
+          strategy: "ff_or_safe_merge"
+
+      # Step 5: Envia os commits para o servidor remoto com retries e backoff exponencial
+      - action: "git.push"
+        params:
+          remote: "origin"
+          branch: "master"
+          max_retries: 5
+          retry_backoff: "exponential"
