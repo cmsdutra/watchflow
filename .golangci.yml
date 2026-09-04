@@ -41,6 +41,9 @@ linters-settings:
     ignore-words:
       - comando
       - comandos
+      - persistente
+      - operacional
+      - definitivo
 
 issues:
   exclude-use-default: false
