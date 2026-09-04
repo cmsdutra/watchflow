@@ -209,6 +209,17 @@ func (s *Store) UpdateWatcherSyncTime(id string, success bool, lastErr string) e
 	return err
 }
 
+// UpdateWatcherEventTime atualiza o timestamp do último evento detectado no watcher.
+func (s *Store) UpdateWatcherEventTime(id string) error {
+	query := `
+	UPDATE watchers
+	SET last_event_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+	WHERE id = ?;
+	`
+	_, err := s.db.Exec(query, id)
+	return err
+}
+
 // EnqueueJob insere atomicamente um novo Job com status PENDING na fila SQLite.
 func (s *Store) EnqueueJob(job *Job) error {
 	payloadJSON, err := json.Marshal(job.PayloadFiles)

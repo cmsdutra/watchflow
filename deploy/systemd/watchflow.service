@@ -1,0 +1,24 @@
+[Unit]
+Description=WatchFlow — Filesystem-driven autonomous Git automation daemon
+Documentation=https://github.com/watchflow/watchflow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/watchflow start --foreground
+ExecStop=%h/.local/bin/watchflow stop
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Hardening e segurança na sessão do usuário
+NoNewPrivileges=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+
+[Install]
+WantedBy=default.target

@@ -50,6 +50,7 @@ linters-settings:
       - supressão
       - supress
       - respondendo
+      - momento
 
 issues:
   exclude-use-default: false
