@@ -45,6 +45,7 @@ linters-settings:
       - operacional
       - definitivo
       - exponencial
+      - adquire
 
 issues:
   exclude-use-default: false
