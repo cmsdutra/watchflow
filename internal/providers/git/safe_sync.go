@@ -3,10 +3,13 @@ package git
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/watchflow/watchflow/internal/locking"
+	"github.com/watchflow/watchflow/internal/normalizer"
 	"github.com/watchflow/watchflow/internal/pipeline"
 	"github.com/watchflow/watchflow/internal/providers"
 )
@@ -185,6 +188,7 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 				ErrorMessage: fmt.Sprintf("fast-forward falhou inesperadamente: %v", ffErr),
 			}, ffErr
 		}
+		a.suppressEchoChanges(ctx.Context, ctx.BasePath)
 		return &providers.StepResult{
 			Success: true,
 			Output:  fmt.Sprintf("fast-forward concluído com sucesso (%d commits integrados): %s", behind, ffOut),
@@ -194,6 +198,7 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 	// Caso D: Divergência paralela (behind > 0 && ahead > 0) — Tenta merge seguro sem edição
 	mergeOut, mergeErr := runGit(ctx.Context, ctx.BasePath, "merge", "--no-edit", remoteRef)
 	if mergeErr == nil {
+		a.suppressEchoChanges(ctx.Context, ctx.BasePath)
 		// Merge automático de três vias concluído com sucesso e sem conflitos de linhas
 		return &providers.StepResult{
 			Success: true,
@@ -219,4 +224,23 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 		ConflictErr:  true,
 		ErrorMessage: errMsg,
 	}, providers.ErrConflict
+}
+
+func (a *SafeSyncAction) suppressEchoChanges(ctx context.Context, basePath string) {
+	diffOut, err := runGit(ctx, basePath, "diff", "--name-only", "ORIG_HEAD", "HEAD")
+	if err != nil || strings.TrimSpace(diffOut) == "" {
+		return
+	}
+
+	var fullPaths []string
+	for _, f := range strings.Split(strings.TrimSpace(diffOut), "\n") {
+		trimmed := strings.TrimSpace(f)
+		if trimmed != "" {
+			fullPaths = append(fullPaths, filepath.Join(basePath, trimmed))
+		}
+	}
+
+	if len(fullPaths) > 0 {
+		normalizer.DefaultEchoSuppressor.SuppressMultiple(fullPaths, 2*time.Second)
+	}
 }

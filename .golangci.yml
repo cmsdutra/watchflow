@@ -47,6 +47,8 @@ linters-settings:
       - exponencial
       - adquire
       - argumentos
+      - supressão
+      - supress
 
 issues:
   exclude-use-default: false

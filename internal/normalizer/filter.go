@@ -43,17 +43,18 @@ type NormalizedEvent struct {
 
 // Filter gerencia o casamento de padrões e normalização de eventos para um diretório raiz.
 type Filter struct {
-	baseDir       string
-	compiledGlobs []*glob.Pattern
-	patterns      []string
+	baseDir        string
+	compiledGlobs  []*glob.Pattern
+	patterns       []string
+	echoSuppressor *EchoSuppressor
 }
 
 // NewFilter inicializa o motor de filtragem compilando as regras glob fornecidas.
 func NewFilter(baseDir string, userPatterns []string) (*Filter, error) {
 	cleanBase := filepath.Clean(baseDir)
 	canonicalBase, err := filepath.EvalSymlinks(cleanBase)
-	if err != nil {
-		canonicalBase = cleanBase
+	if err == nil {
+		cleanBase = canonicalBase
 	}
 
 	rawPatterns := make([]string, 0, len(DefaultIgnorePatterns)+len(userPatterns))
@@ -81,15 +82,27 @@ func NewFilter(baseDir string, userPatterns []string) (*Filter, error) {
 	}
 
 	return &Filter{
-		baseDir:       canonicalBase,
-		compiledGlobs: compiled,
-		patterns:      uniquePatterns,
+		baseDir:        cleanBase,
+		compiledGlobs:  compiled,
+		patterns:       uniquePatterns,
+		echoSuppressor: DefaultEchoSuppressor,
 	}, nil
 }
 
-// ShouldIgnore avalia se o caminho especificado deve ser descartado por casamento com regras de ignore.
+// SetEchoSuppressor define uma instância personalizada de supressor de eco para o filtro.
+func (f *Filter) SetEchoSuppressor(es *EchoSuppressor) {
+	f.echoSuppressor = es
+}
+
+// ShouldIgnore avalia se o caminho especificado deve ser descartado por casamento com regras de ignore ou supressão de eco.
 func (f *Filter) ShouldIgnore(absPath string) bool {
 	cleanPath := filepath.Clean(absPath)
+
+	// 1. Checa se o arquivo foi manipulado internamente pelo daemon (Echo Suppression)
+	if f.echoSuppressor != nil && f.echoSuppressor.IsSuppressed(cleanPath) {
+		return true
+	}
+
 	slashPath := filepath.ToSlash(cleanPath)
 
 	// Proteção de segurança: eventos fora da raiz monitorada são rejeitados
