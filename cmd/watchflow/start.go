@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/watchflow/watchflow/internal/config"
 	"github.com/watchflow/watchflow/internal/core"
+	"github.com/watchflow/watchflow/internal/logger"
 )
 
 var foregroundFlag bool
@@ -23,7 +26,8 @@ var startCmd = &cobra.Command{
 }
 
 func init() {
-	startCmd.Flags().BoolVarP(&foregroundFlag, "foreground", "f", false, "Executa o daemon no terminal foreground")
+	startCmd.Flags().BoolVarP(&foregroundFlag, "foreground", "f", false,
+		"Força o resumo legível em stdout (por padrão exibido apenas quando stdout é um terminal)")
 	rootCmd.AddCommand(startCmd)
 }
 
@@ -42,6 +46,34 @@ func runStart(cmd *cobra.Command, args []string) error {
 		cfg.Daemon.SocketPath = socketFlag
 	}
 
+	// Logging estruturado precisa existir antes do coordenador para capturar
+	// falhas de registro de watcher e o relatório de recuperação pós-crash.
+	logLevel := cfg.Daemon.LogLevel
+	if verbose {
+		logLevel = "debug"
+	}
+
+	stateDir := config.ExpandPath(cfg.Daemon.StateDir)
+	logCloser, err := logger.Setup(logger.Options{
+		Level:  logLevel,
+		Dir:    stateDir,
+		Stderr: true,
+	})
+	if err != nil {
+		return fmt.Errorf("falha ao inicializar o subsistema de logs: %w", err)
+	}
+	if logCloser != nil {
+		defer func() { _ = logCloser.Close() }()
+	}
+
+	log := logger.For("daemon")
+	log.Info("iniciando WatchFlow",
+		slog.String("versao", version),
+		slog.String("commit", commit),
+		slog.String("config", cfgPath),
+		slog.String("state_dir", stateDir),
+		slog.String("log_level", logLevel))
+
 	coordinator, err := core.NewCoordinator(cfg, version)
 	if err != nil {
 		return fmt.Errorf("falha ao inicializar coordenador do daemon: %w", err)
@@ -56,16 +88,25 @@ func runStart(cmd *cobra.Command, args []string) error {
 		coordErrCh <- coordinator.Start(ctx)
 	}()
 
-	fmt.Println("🚀 WatchFlow daemon iniciado com sucesso.")
-	fmt.Printf("Versão: %s | PID: %d\n", version, os.Getpid())
-	fmt.Printf("Socket IPC: %s\n", config.ExpandPath(cfg.Daemon.SocketPath))
-	fmt.Printf("Watchers ativos: %d\n", len(cfg.Watchers))
+	// Sob systemd o resumo decorado é ruído no journald, que já recebe o log
+	// estruturado; em um terminal ele é a confirmação que o usuário espera.
+	if foregroundFlag || isTerminal(os.Stdout) {
+		fmt.Println("🚀 WatchFlow daemon iniciado com sucesso.")
+		fmt.Printf("Versão: %s | PID: %d\n", version, os.Getpid())
+		fmt.Printf("Socket IPC: %s\n", config.ExpandPath(cfg.Daemon.SocketPath))
+		fmt.Printf("Watchers ativos: %d\n", len(cfg.Watchers))
+		fmt.Printf("Log JSON: %s\n", filepath.Join(stateDir, logger.LogFileName))
+	}
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("\n🛑 Sinal de encerramento recebido (SIGINT/SIGTERM). Encerrando graciosamente...")
+		if foregroundFlag || isTerminal(os.Stdout) {
+			fmt.Println("\n🛑 Sinal de encerramento recebido (SIGINT/SIGTERM). Encerrando graciosamente...")
+		}
+		log.Info("sinal de encerramento recebido")
 	case err := <-coordErrCh:
 		if err != nil {
+			log.Error("daemon encerrou com erro", slog.Any("error", err))
 			return fmt.Errorf("erro durante execução do daemon: %w", err)
 		}
 	}
@@ -77,6 +118,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("erro durante shutdown: %w", err)
 	}
 
-	fmt.Println("✅ WatchFlow encerrado com sucesso.")
+	if foregroundFlag || isTerminal(os.Stdout) {
+		fmt.Println("✅ WatchFlow encerrado com sucesso.")
+	}
 	return nil
+}
+
+// isTerminal informa se o descritor está ligado a um terminal interativo.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

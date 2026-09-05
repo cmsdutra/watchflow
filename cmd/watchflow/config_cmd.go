@@ -6,6 +6,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/watchflow/watchflow/internal/config"
+	// Popula providers.DefaultRegistry para que 'config validate' consiga
+	// verificar os nomes de action declarados no YAML.
+	_ "github.com/watchflow/watchflow/internal/providers/git"
 )
 
 var configCmd = &cobra.Command{
@@ -43,6 +46,7 @@ var configValidateCmd = &cobra.Command{
 			cmd.Printf("    • [%s] %s -> %s (debounce: %s, max_wait: %s)\n",
 				status, w.Name, w.ResolvedPath, w.Debounce, w.MaxWait)
 		}
+		cmd.Printf("  - Notificações: %v (backend: %s)\n", cfg.Notifications.Enabled, cfg.Notifications.Backend)
 		cmd.Printf("  - Pipelines declarados: %d\n", len(cfg.Pipelines))
 		for pName, p := range cfg.Pipelines {
 			cmd.Printf("    • %s (timeout: %s, steps: %d)\n", pName, p.Timeout, len(p.Steps))

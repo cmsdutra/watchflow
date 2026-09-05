@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/watchflow/watchflow/internal/ipc"
 )
 
@@ -36,6 +38,25 @@ func (m *cliMockHandler) Status(ctx context.Context) (*ipc.StatusResponse, error
 			},
 		},
 	}, nil
+}
+
+func (m *cliMockHandler) Jobs(_ context.Context, _ string, _ int) (*ipc.JobsResponse, error) {
+	return &ipc.JobsResponse{Jobs: []ipc.JobDTO{
+		{ID: "job_1788000000000_vault_sync", WatcherID: "obsidian-vault", PipelineName: "vault-sync",
+			Status: "PENDING", Files: 3, RetryCount: 1, MaxRetries: 5, ScheduledFor: "2026-09-04 10:00:05"},
+		{ID: "job_1788000000001_vault_sync", WatcherID: "obsidian-vault", PipelineName: "vault-sync",
+			Status: "BLOCKED", Files: 2, RetryCount: 0, MaxRetries: 5, LastError: "conflito de merge detectado"},
+	}}, nil
+}
+
+func (m *cliMockHandler) Runs(_ context.Context, _ string, _ int) (*ipc.RunsResponse, error) {
+	return &ipc.RunsResponse{Runs: []ipc.RunDTO{
+		{ID: "run_1", JobID: "job_1", WatcherID: "obsidian-vault", PipelineName: "vault-sync",
+			Status: "SUCCESS", DurationMs: 1250, CreatedAt: "2026-09-04 10:00:00"},
+		{ID: "run_2", JobID: "job_2", WatcherID: "obsidian-vault", PipelineName: "vault-sync",
+			Status: "FAILED", DurationMs: 300, ErrorStep: "git.push",
+			ErrorDetails: "could not resolve host", CreatedAt: "2026-09-04 10:01:00"},
+	}}, nil
 }
 
 func (m *cliMockHandler) Sync(ctx context.Context, watcherName string) (*ipc.SyncResponse, error) {
@@ -84,7 +105,25 @@ func setupMockIPCServer(t *testing.T) string {
 	return sockPath
 }
 
+// resetCommandFlags devolve todas as flags aos valores padrão. O rootCmd é uma
+// variável global compartilhada: sem isso, uma flag ligada por um teste (ex.:
+// --json) vaza para os testes seguintes e para execuções repetidas com -count>1.
+func resetCommandFlags(cmd *cobra.Command) {
+	reset := func(f *pflag.Flag) {
+		_ = f.Value.Set(f.DefValue)
+		f.Changed = false
+	}
+	cmd.Flags().VisitAll(reset)
+	cmd.PersistentFlags().VisitAll(reset)
+
+	for _, sub := range cmd.Commands() {
+		resetCommandFlags(sub)
+	}
+}
+
 func executeCommand(args ...string) (string, error) {
+	resetCommandFlags(rootCmd)
+
 	buf := new(bytes.Buffer)
 	rootCmd.SetOut(buf)
 	rootCmd.SetErr(buf)

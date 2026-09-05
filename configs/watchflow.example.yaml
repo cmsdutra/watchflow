@@ -27,6 +27,10 @@ notifications:
   on_conflict: true   # Alerta desktop obrigatório se houver colisão de merge
   backend: "desktop"  # desktop (notify-send), log, webhook
 
+  # Obrigatório apenas quando backend == "webhook".
+  # Recebe um POST JSON com {kind, watcher, title, message, detail, timestamp}.
+  # webhook_url: "https://exemplo.com/hooks/watchflow"
+
 # Diretórios raízes vigiados pelo daemon
 watchers:
   - name: "personal-vault"
@@ -59,36 +63,47 @@ pipelines:
     # Tempo limite máximo para conclusão de toda a sequência antes de abortar
     timeout: "120s"
 
+    # Tentativas antes de a falha virar definitiva. Omitido = 5.
+    # Falhas de rede recuam exponencialmente (5s*2^n, teto 300s); rejeições de
+    # push por avanço do remoto usam espera curta (1s*2^n, teto 15s), já que
+    # basta refazer o safe_sync para reconvergir.
+    max_retries: 5
+
     # Passos executados linearmente (interrompe imediatamente se algum passo falhar)
     steps:
-      # Step 1: Verifica e aguarda travas externas alheias (.git/index.lock)
+      # Step 1: Verifica e aguarda travas externas alheias (.git/index.lock).
+      # O daemon JAMAIS remove uma trava de terceiros; apenas aguarda.
       - action: "git.check_locks"
         params:
           max_wait_lock: "10s"
+          poll_interval: "200ms"
 
-      # Step 2: Adiciona todas as modificações reais da árvore de trabalho
+      # Step 2: Adiciona as modificações da árvore de trabalho.
+      # all: true  -> git add -A (varre a árvore inteira)
+      # all: false -> adiciona apenas os arquivos do lote que disparou o job
       - action: "git.add"
         params:
           all: true
 
-      # Step 3: Cria commit local (não cria se a árvore estiver limpa / no-op)
+      # Step 3: Cria o commit local. Sem alterações staged o step é pulado,
+      # portanto nunca gera commits vazios (use allow_empty: true para forçar).
+      # Placeholders: {timestamp} {iso_timestamp} {date} {time} {watcher} {files_count}
       - action: "git.commit"
         params:
-          message: "watchflow: auto-sync {{timestamp}}"
+          message: "watchflow: auto-sync {timestamp}"
           allow_empty: false
 
-      # Step 4: Protocolo Safe Git Sync: fetch, inspeciona divergência e aplica merge limpo.
-      # Se houver qualquer conflito de linhas, executa git merge --abort imediatamente.
+      # Step 4: Protocolo Safe Git Sync: fetch, inspeciona a divergência e aplica
+      # fast-forward ou merge de 3 vias. Havendo conflito de linhas, executa
+      # 'git merge --abort' imediatamente e interrompe o watcher.
+      # Omita 'branch' para usar automaticamente o branch ativo do repositório.
       - action: "git.safe_sync"
         params:
           remote: "origin"
-          branch: "master"
-          strategy: "ff_or_safe_merge"
 
-      # Step 5: Envia os commits para o servidor remoto com retries e backoff exponencial
+      # Step 5: Envia os commits para o remoto.
+      # O número de tentativas e o backoff exponencial são propriedades do job na
+      # fila (max_retries=5, backoff 5s*2^n até 300s), não deste step.
       - action: "git.push"
         params:
           remote: "origin"
-          branch: "master"
-          max_retries: 5
-          retry_backoff: "exponential"
