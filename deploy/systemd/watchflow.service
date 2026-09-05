@@ -14,10 +14,13 @@ TimeoutStopSec=10s
 KillMode=mixed
 KillSignal=SIGTERM
 
-# Hardening e segurança na sessão do usuário
+# Hardening e segurança na sessão do usuário.
+# ProtectKernelModules= é omitido de propósito: em uma unidade de usuário ele
+# implica derrubar CAP_SYS_MODULE do bounding set, o que exige CAP_SETPCAP e
+# falha com 218/CAPABILITIES em kernels que restringem user namespaces sem
+# privilégio (Ubuntu 24.04+ com AppArmor).
 NoNewPrivileges=yes
 ProtectControlGroups=yes
-ProtectKernelModules=yes
 ProtectKernelTunables=yes
 
 [Install]
