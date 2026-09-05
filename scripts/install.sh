@@ -105,13 +105,113 @@ if [[ "$(uname -s)" != "Linux" ]]; then
        sockets Unix e systemd --user). Veja as limitações conhecidas no README."
 fi
 
-command -v git >/dev/null 2>&1 || die "git não encontrado no PATH. Instale-o antes de continuar."
+# O script não instala nada com sudo: ele diz exatamente o que rodar. Assim
+# permanece inteiramente confinado ao $HOME do usuário.
+
+detect_pkg_manager() {
+    local mgr
+    for mgr in apt-get dnf pacman zypper apk; do
+        if command -v "$mgr" >/dev/null 2>&1; then
+            printf '%s' "$mgr"
+            return 0
+        fi
+    done
+    printf 'desconhecido'
+}
+
+pkg_install_cmd() {
+    case "$(detect_pkg_manager)" in
+        apt-get) printf 'sudo apt-get install -y %s' "$1" ;;
+        dnf)     printf 'sudo dnf install -y %s' "$1" ;;
+        pacman)  printf 'sudo pacman -S --needed %s' "$1" ;;
+        zypper)  printf 'sudo zypper install -y %s' "$1" ;;
+        apk)     printf 'sudo apk add %s' "$1" ;;
+        *)       printf 'instale o pacote "%s" pelo gerenciador da sua distribuição' "$1" ;;
+    esac
+}
+
+# go_arch traduz uname -m para o sufixo usado nos tarballs do go.dev
+go_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        armv6l|armv7l) printf 'armv6l' ;;
+        i686|i386)     printf '386' ;;
+        *)             printf '%s' "$(uname -m)" ;;
+    esac
+}
+
+# A versão exigida vem do go.mod para que esta mensagem não fique defasada
+required_go_version() {
+    awk '/^go [0-9]/ { print $2; exit }' "$REPO_ROOT/go.mod"
+}
+
+# normalize_version completa a versão para três campos, para que "1.24" não seja
+# considerado menor que "1.24.0" na comparação.
+normalize_version() {
+    local v="$1"
+    while [[ "$(printf '%s' "$v" | tr -cd '.' | wc -c)" -lt 2 ]]; do
+        v="$v.0"
+    done
+    printf '%s' "$v"
+}
+
+# version_lt compara "1.24.0" com "1.21.5" numericamente, campo a campo.
+# Uma comparação textual erraria: "1.9.0" > "1.24.0" em ordem alfabética.
+version_lt() {
+    local a b lowest
+    a="$(normalize_version "$1")"
+    b="$(normalize_version "$2")"
+
+    [[ "$a" == "$b" ]] && return 1
+    lowest="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)"
+    [[ "$lowest" == "$a" ]]
+}
+
+go_install_instructions() {
+    local want arch
+    want="$(required_go_version)"
+    arch="$(go_arch)"
+
+    cat <<INSTR
+
+  O Go distribuído pelos repositórios costuma ser antigo demais — este projeto
+  exige a versão $want ou superior. Instale a oficial:
+
+    curl -LO https://go.dev/dl/go${want}.linux-${arch}.tar.gz
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf go${want}.linux-${arch}.tar.gz
+    export PATH="/usr/local/go/bin:\$PATH"
+
+  Versões mais recentes estão em https://go.dev/dl/
+
+  Alternativa: se você já tem o binário compilado em bin/, rode este script com
+  --no-build e o Go não será necessário.
+INSTR
+}
+
+if ! command -v git >/dev/null 2>&1; then
+    die "git não encontrado no PATH. Instale-o com:
+
+    $(pkg_install_cmd git)
+"
+fi
 ok "git $(git --version | awk '{print $3}')"
 
 if [[ $DO_BUILD -eq 1 ]]; then
-    command -v go >/dev/null 2>&1 || die "go não encontrado no PATH.
-       Instale o Go 1.24+ ou rode com --no-build se já tiver o binário em bin/."
-    ok "go $(go version | awk '{print $3}')"
+    if ! command -v go >/dev/null 2>&1; then
+        die "go não encontrado no PATH.$(go_install_instructions)"
+    fi
+
+    # Presença não basta: compilar com um Go antigo falha com um erro do
+    # compilador bem menos claro do que este aviso.
+    GO_VERSION="$(go version | awk '{print $3}' | sed 's/^go//')"
+    GO_REQUIRED="$(required_go_version)"
+
+    if version_lt "$GO_VERSION" "$GO_REQUIRED"; then
+        die "go $GO_VERSION instalado, mas este projeto exige $GO_REQUIRED ou superior.$(go_install_instructions)"
+    fi
+    ok "go $GO_VERSION (exigido: $GO_REQUIRED+)"
 fi
 
 # ---------------------------------------------------------------------------

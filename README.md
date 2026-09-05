@@ -156,6 +156,12 @@ O script compila o binário, instala em `~/.local/bin`, cria a configuração
 inicial a partir do exemplo comentado e registra o serviço no systemd. Ele
 avisa se `~/.local/bin` não estiver no seu `PATH`.
 
+**Ele não instala dependências com `sudo`.** Se faltar o Git ou o Go, ele
+mostra o comando exato para a sua distribuição e para de forma clara. No caso
+do Go, ele também confere a *versão* — o Go dos repositórios costuma ser antigo
+demais para compilar o projeto, então a orientação aponta para o tarball
+oficial em vez do pacote da distro.
+
 Rodar de novo mais tarde atualiza o binário sem tocar na sua configuração nem
 no estado do daemon — é assim que você atualiza para uma versão nova.
 
