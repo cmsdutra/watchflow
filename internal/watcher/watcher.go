@@ -2,13 +2,17 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/watchflow/watchflow/internal/logger"
 )
 
 // EventOp representa o tipo de operação que originou o evento de sistema de arquivos.
@@ -45,6 +49,7 @@ type Watcher struct {
 	events    chan FileEvent
 	errors    chan error
 	done      chan struct{}
+	log       *slog.Logger
 	closeOnce sync.Once
 }
 
@@ -87,6 +92,7 @@ func New(name, rootPath string) (*Watcher, error) {
 		events:    make(chan FileEvent, 1024),
 		errors:    make(chan error, 64),
 		done:      make(chan struct{}),
+		log:       logger.For("watcher").With(slog.String("watcher", name)),
 	}
 
 	return w, nil
@@ -115,7 +121,9 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 			select {
 			case w.errors <- err:
 			default:
-				// Canal de erros cheio; descarta para não bloquear o loop do watcher
+				// Canal de erros cheio; descarta para não bloquear o loop do
+				// watcher, mas registra para não sumir sem rastro.
+				w.log.Error("erro do fsnotify descartado (canal de erros saturado)", slog.Any("error", err))
 			}
 
 		case ev, ok := <-w.fsWatcher.Events:
@@ -135,12 +143,27 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 
 			// Se uma nova pasta foi criada, registra recursivamente para monitoramento dinâmico
 			if ev.Op&fsnotify.Create != 0 && isDir {
-				_ = w.tree.WalkAndAdd(cleanPath)
+				if err := w.tree.WalkAndAdd(cleanPath); err != nil {
+					// Ponto cego: alterações dentro deste diretório deixam de
+					// gerar eventos e não serão sincronizadas.
+					w.log.Error("falha ao registrar novo diretório para monitoramento",
+						slog.String("path", cleanPath), slog.Any("error", err))
+				} else {
+					w.log.Debug("novo diretório sob monitoramento", slog.String("path", cleanPath))
+					// Entre o mkdir e o registro do watch existe uma janela em
+					// que o kernel não reporta nada. Arquivos gravados nela
+					// (git clone, unzip, cp -r) ficariam invisíveis até serem
+					// tocados de novo, então são varridos e reemitidos.
+					w.emitExistingEntries(ctx, cleanPath)
+				}
 			}
 
 			// Se uma pasta foi removida, retira do mapa interno
 			if ev.Op&fsnotify.Remove != 0 && w.tree.Has(cleanPath) {
-				_ = w.tree.RemoveDir(cleanPath)
+				if err := w.tree.RemoveDir(cleanPath); err != nil {
+					w.log.Warn("falha ao remover diretório do monitoramento",
+						slog.String("path", cleanPath), slog.Any("error", err))
+				}
 			}
 
 			event := FileEvent{
@@ -160,6 +183,50 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 				return
 			}
 		}
+	}
+}
+
+// emitExistingEntries varre um diretório recém-registrado e emite eventos
+// sintéticos para o conteúdo que já existia, fechando a janela de corrida do
+// inotify. Executa na goroutine do eventLoop e aplica contrapressão normalmente.
+func (w *Watcher) emitExistingEntries(ctx context.Context, dir string) {
+	count := 0
+
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // Diretório removido no meio da varredura: ignora o ramo
+		}
+		if path == dir {
+			return nil
+		}
+
+		event := FileEvent{
+			WatcherName: w.name,
+			Path:        filepath.Clean(path),
+			Op:          OpCreate,
+			Timestamp:   time.Now(),
+			IsDir:       d.IsDir(),
+		}
+
+		select {
+		case w.events <- event:
+			count++
+		case <-ctx.Done():
+			return fs.SkipAll
+		case <-w.done:
+			return fs.SkipAll
+		}
+		return nil
+	})
+
+	if walkErr != nil && !errors.Is(walkErr, fs.SkipAll) {
+		w.log.Warn("varredura de diretório recém-criado interrompida",
+			slog.String("path", dir), slog.Any("error", walkErr))
+	}
+
+	if count > 0 {
+		w.log.Debug("conteúdo preexistente de diretório novo reemitido",
+			slog.String("path", dir), slog.Int("entradas", count))
 	}
 }
 
