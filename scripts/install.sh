@@ -48,17 +48,18 @@ usage() {
     cat <<EOF
 Instalador do WatchFlow.
 
-Uso: scripts/install.sh [opções]
+Uso: $(basename "$0") [opções]
 
 Opções:
-  --prefix DIR    Onde instalar o binário (padrão: ~/.local/bin)
+  --prefix DIR    Onde instalar o binário (padrão: $PREFIX)
   --no-service    Não registra a unit do systemd --user
   --no-build      Usa o binário já existente em bin/ em vez de recompilar
   --yes, -y       Não faz perguntas; assume "sim" para tudo
   --help, -h      Exibe esta ajuda
 
 O script NUNCA sobrescreve uma configuração existente e NUNCA remove dados.
-Para desinstalar, use scripts/uninstall.sh
+Para desinstalar depois, use o comando 'watchflow-uninstall', que este script
+instala junto do binário e funciona sem o código-fonte.
 EOF
 }
 

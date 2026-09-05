@@ -41,13 +41,16 @@ skip()  { printf '  %s·%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
 die()   { printf '%serro:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 usage() {
+    # O script é instalado como 'watchflow-uninstall' ao lado do binário; citar
+    # o caminho do repositório mandaria o usuário procurar um fonte que ele pode
+    # já ter apagado — que é justamente o caso que esta cópia cobre.
     cat <<EOF
 Desinstalador do WatchFlow.
 
-Uso: scripts/uninstall.sh [opções]
+Uso: $(basename "$0") [opções]
 
 Opções:
-  --prefix DIR    Onde o binário foi instalado (padrão: ~/.local/bin)
+  --prefix DIR    Onde o binário foi instalado (padrão: $PREFIX)
   --purge         Também apaga a configuração e o estado do daemon
   --yes, -y       Não faz perguntas; assume "sim" para tudo
   --help, -h      Exibe esta ajuda
