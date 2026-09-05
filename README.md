@@ -174,6 +174,9 @@ Opções:
 | `--no-build` | Usa o binário já existente em `bin/` |
 | `--yes` | Não faz perguntas |
 
+O `--prefix` que você usar fica registrado no desinstalador, então não precisa
+repeti-lo na hora de remover.
+
 ### Instalação manual
 
 Se preferir controlar cada passo:
@@ -191,6 +194,15 @@ watchflow version
 ```
 
 ### Desinstalação
+
+O instalador copia o desinstalador para junto do binário, então ele funciona de
+qualquer diretório mesmo que você já tenha apagado este repositório:
+
+```bash
+watchflow-uninstall
+```
+
+Se ainda tiver o código-fonte, o equivalente é:
 
 ```bash
 ./scripts/uninstall.sh

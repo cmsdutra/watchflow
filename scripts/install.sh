@@ -239,6 +239,16 @@ mkdir -p "$PREFIX"
 install -m 0755 "$BUILT_BINARY" "$PREFIX/$BINARY_NAME"
 ok "$PREFIX/$BINARY_NAME"
 
+# O desinstalador é autocontido: não referencia o repositório em ponto algum.
+# Instalá-lo junto do binário resolve o caso de o usuário apagar o clone depois
+# — sem precisar mover o código-fonte dele de lugar nem criar um symlink que
+# ficaria pendurado se o fonte sumisse.
+UNINSTALLER="$PREFIX/$BINARY_NAME-uninstall"
+sed "s|^PREFIX=.*|PREFIX=\"\${PREFIX:-$PREFIX}\"|" \
+    "$REPO_ROOT/scripts/uninstall.sh" > "$UNINSTALLER"
+chmod 0755 "$UNINSTALLER"
+ok "$UNINSTALLER"
+
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)
@@ -348,14 +358,22 @@ interativo. O arquivo criado é o exemplo comentado; ajuste-o antes de usar.
 
 A pasta que você indicar em 'path' precisa já ser um repositório Git com um
 remoto configurado.
+
+Para desinstalar depois, de qualquer diretório:
+
+  $BINARY_NAME-uninstall
+
+Não é preciso guardar este repositório: o desinstalador foi copiado junto do
+binário e funciona sozinho.
 EOF
 else
     cat <<EOF
 Binário atualizado. Sua configuração e seu estado não foram tocados.
 
-  $BINARY_NAME status        estado das pastas monitoradas
-  $BINARY_NAME tui           painel interativo
-  $BINARY_NAME logs -f       acompanhar os eventos
+  $BINARY_NAME status            estado das pastas monitoradas
+  $BINARY_NAME tui               painel interativo
+  $BINARY_NAME logs -f           acompanhar os eventos
+  $BINARY_NAME-uninstall         remover o WatchFlow
 EOF
 fi
 

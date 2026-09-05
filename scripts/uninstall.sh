@@ -151,6 +151,14 @@ if [[ -n "$OTHER" ]]; then
     warn "ainda existe um '$BINARY_NAME' em $OTHER — remova-o à mão se quiser."
 fi
 
+# O próprio desinstalador, instalado ao lado do binário. Removê-lo enquanto ele
+# executa é seguro no Linux: o inode continua aberto até o processo terminar.
+SELF_INSTALLED="$PREFIX/$BINARY_NAME-uninstall"
+if [[ -e "$SELF_INSTALLED" ]]; then
+    rm -f "$SELF_INSTALLED"
+    ok "$SELF_INSTALLED"
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Dados do usuário
 # ---------------------------------------------------------------------------
