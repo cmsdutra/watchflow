@@ -52,7 +52,15 @@ type Debouncer struct {
 	maxWaitTimer  *time.Timer
 	timerActive   bool
 	closed        bool
+
+	startOnce   sync.Once
+	emitTimeout time.Duration
 }
+
+// defaultEmitTimeout limita por quanto tempo o debouncer aplica contrapressão
+// aguardando o consumidor drenar o canal de saída antes de devolver o lote ao
+// buffer pendente. Nenhum lote é descartado em nenhum dos dois caminhos.
+const defaultEmitTimeout = 30 * time.Second
 
 // New instancia um novo Debouncer validando os parâmetros temporais.
 func New(watcherName string, debounce, maxWait time.Duration) (*Debouncer, error) {
@@ -74,6 +82,7 @@ func New(watcherName string, debounce, maxWait time.Duration) (*Debouncer, error
 		out:          make(chan EventBatch, 64),
 		done:         make(chan struct{}),
 		pendingFiles: make(map[string]struct{}),
+		emitTimeout:  defaultEmitTimeout,
 	}, nil
 }
 
@@ -97,9 +106,12 @@ func (d *Debouncer) Add(ev normalizer.NormalizedEvent) bool {
 	}
 }
 
-// Start inicia o loop assíncrono de debounce e timers.
+// Start inicia o loop assíncrono de debounce e timers. É idempotente: chamadas
+// subsequentes são ignoradas para garantir um único proprietário do canal de saída.
 func (d *Debouncer) Start(ctx context.Context) {
-	go d.loop(ctx)
+	d.startOnce.Do(func() {
+		go d.loop(ctx)
+	})
 }
 
 func (d *Debouncer) loop(ctx context.Context) {
@@ -108,6 +120,10 @@ func (d *Debouncer) loop(ctx context.Context) {
 
 	d.maxWaitTimer = time.NewTimer(d.maxWait)
 	stopTimer(d.maxWaitTimer)
+
+	// O fechamento de 'out' sinaliza ao consumidor que o lote final já foi
+	// entregue, permitindo que ele drene tudo antes de encerrar.
+	defer close(d.out)
 
 	for {
 		select {
@@ -167,33 +183,25 @@ func (d *Debouncer) handleEvent(ev normalizer.NormalizedEvent) {
 }
 
 func (d *Debouncer) handleTimeout(trigger BatchTrigger) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if !d.timerActive || len(d.pendingFiles) == 0 {
-		return
-	}
-
-	stopTimer(d.debounceTimer)
-	stopTimer(d.maxWaitTimer)
-	d.timerActive = false
-
-	batch := d.buildBatchLocked(trigger)
-	d.resetBatchLocked()
-
-	select {
-	case d.out <- batch:
-	default:
-		// Canal de saída cheio
+	if batch, ok := d.takeBatch(trigger); ok {
+		d.emit(batch)
 	}
 }
 
 func (d *Debouncer) flush(trigger BatchTrigger) {
+	if batch, ok := d.takeBatch(trigger); ok {
+		d.emit(batch)
+	}
+}
+
+// takeBatch consome o lote pendente sob trava e desarma os timers.
+// Retorna false quando não há nada acumulado para despachar.
+func (d *Debouncer) takeBatch(trigger BatchTrigger) (EventBatch, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if !d.timerActive || len(d.pendingFiles) == 0 {
-		return
+		return EventBatch{}, false
 	}
 
 	stopTimer(d.debounceTimer)
@@ -203,9 +211,52 @@ func (d *Debouncer) flush(trigger BatchTrigger) {
 	batch := d.buildBatchLocked(trigger)
 	d.resetBatchLocked()
 
+	return batch, true
+}
+
+// emit entrega o lote ao consumidor aplicando contrapressão em vez de descartá-lo.
+// Se o consumidor não drenar dentro de emitTimeout, o lote é devolvido ao buffer
+// pendente para ser reemitido no próximo ciclo — nunca é perdido.
+// Sempre executado na goroutine do loop, que é a única proprietária dos timers.
+func (d *Debouncer) emit(batch EventBatch) {
 	select {
 	case d.out <- batch:
+		return
 	default:
+	}
+
+	timer := time.NewTimer(d.emitTimeout)
+	defer timer.Stop()
+
+	select {
+	case d.out <- batch:
+	case <-timer.C:
+		d.requeueBatch(batch)
+	}
+}
+
+// requeueBatch reintegra um lote não entregue ao buffer pendente, rearmando os
+// timers para que ele seja despachado novamente no ciclo seguinte.
+func (d *Debouncer) requeueBatch(batch EventBatch) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, f := range batch.Files {
+		d.pendingFiles[f] = struct{}{}
+	}
+	d.eventsCount += batch.EventsCount
+
+	if d.firstEventAt.IsZero() || (!batch.FirstEvent.IsZero() && batch.FirstEvent.Before(d.firstEventAt)) {
+		d.firstEventAt = batch.FirstEvent
+	}
+	if batch.LastEvent.After(d.lastEventAt) {
+		d.lastEventAt = batch.LastEvent
+	}
+
+	if !d.timerActive {
+		d.timerActive = true
+		d.debounceTimer.Reset(d.debounce)
+		d.maxWaitTimer.Reset(d.maxWait)
 	}
 }
 
