@@ -144,17 +144,36 @@ mesmo. Em repouso consome poucos megabytes de memória.
 
 ## Instalação
 
-### Compilando a partir do código
+### Instalação assistida (recomendado)
 
 ```bash
 git clone https://github.com/cmsdutra/watchflow.git
 cd watchflow
-make build
+./scripts/install.sh
 ```
 
-O binário fica em `bin/watchflow`. Copie para algum lugar no seu `PATH`:
+O script compila o binário, instala em `~/.local/bin`, cria a configuração
+inicial a partir do exemplo comentado e registra o serviço no systemd. Ele
+avisa se `~/.local/bin` não estiver no seu `PATH`.
+
+Rodar de novo mais tarde atualiza o binário sem tocar na sua configuração nem
+no estado do daemon — é assim que você atualiza para uma versão nova.
+
+Opções:
+
+| Flag | Efeito |
+|---|---|
+| `--prefix DIR` | Instala o binário em outro diretório |
+| `--no-service` | Não registra a unit do systemd |
+| `--no-build` | Usa o binário já existente em `bin/` |
+| `--yes` | Não faz perguntas |
+
+### Instalação manual
+
+Se preferir controlar cada passo:
 
 ```bash
+make build
 mkdir -p ~/.local/bin
 cp bin/watchflow ~/.local/bin/
 ```
@@ -164,6 +183,19 @@ Confirme que funcionou:
 ```bash
 watchflow version
 ```
+
+### Desinstalação
+
+```bash
+./scripts/uninstall.sh
+```
+
+Para o serviço, remove a unit e apaga o binário. **Sua configuração e o
+histórico do daemon são preservados**, de modo que reinstalar depois devolve
+tudo como estava. Use `--purge` para removê-los também.
+
+As pastas que você sincronizava e os repositórios Git dentro delas nunca são
+tocados, com ou sem `--purge`.
 
 ### Verificando o ambiente
 
@@ -189,8 +221,11 @@ sudo sysctl -p
 
 ## Configuração
 
-A configuração fica em `~/.config/watchflow/config.yaml`. Há um exemplo
-comentado em [`configs/watchflow.example.yaml`](configs/watchflow.example.yaml).
+A configuração fica em `~/.config/watchflow/config.yaml` e é feita **editando o
+arquivo YAML** — não há assistente interativo nem comandos para adicionar
+pastas pela linha de comando. O script de instalação cria o arquivo a partir de
+[`configs/watchflow.example.yaml`](configs/watchflow.example.yaml), que é
+inteiramente comentado; a partir daí é só ajustar.
 
 Um arquivo mínimo para sincronizar uma pasta:
 
@@ -426,6 +461,7 @@ make all      # os três acima
 
 ```
 cmd/watchflow/       comandos de linha de comando
+scripts/             instalação e desinstalação
 internal/
   config/            leitura e validação do YAML
   core/              orquestrador e ciclo de vida
