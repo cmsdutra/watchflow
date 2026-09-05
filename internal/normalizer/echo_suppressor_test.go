@@ -3,6 +3,7 @@ package normalizer_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -182,5 +183,70 @@ func TestSafeSync_EchoSuppressionOn20RemoteNotes(t *testing.T) {
 
 	if acceptedCount != 0 {
 		t.Fatalf("CRITÉRIO DE ACEITE VIOLADO: %d eventos foram aceitos (esperava exatamente 0 eventos)", acceptedCount)
+	}
+}
+
+// TestContentSuppressionLetsUserEditsThrough cobre a regressão introduzida ao
+// abrir a janela de eco antes da operação git: uma supressão puramente por
+// caminho cegava o filtro e engolia uma edição legítima do usuário feita no
+// mesmo arquivo dentro da janela.
+func TestContentSuppressionLetsUserEditsThrough(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "nota.md")
+
+	if err := os.WriteFile(file, []byte("conteúdo escrito pelo daemon"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := normalizer.NewEchoSuppressor(30 * time.Second)
+	s.SuppressContent(file, 30*time.Second)
+
+	if !s.IsSuppressed(file) {
+		t.Error("o próprio conteúdo gravado pelo daemon deveria ser suprimido como eco")
+	}
+
+	// O usuário edita o mesmo arquivo dentro da janela
+	if err := os.WriteFile(file, []byte("edição legítima do usuário"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.IsSuppressed(file) {
+		t.Error("edição do usuário foi confundida com eco e seria descartada silenciosamente")
+	}
+}
+
+func TestContentSuppressionTreatsRemovalAsEcho(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "removido.md")
+
+	if err := os.WriteFile(file, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := normalizer.NewEchoSuppressor(30 * time.Second)
+	s.SuppressContent(file, 30*time.Second)
+
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+
+	if !s.IsSuppressed(file) {
+		t.Error("remoção feita pelo daemon deveria continuar suprimida")
+	}
+}
+
+func TestContentSuppressionExpires(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "nota.md")
+	if err := os.WriteFile(file, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := normalizer.NewEchoSuppressor(30 * time.Millisecond)
+	s.SuppressContent(file, 30*time.Millisecond)
+
+	time.Sleep(80 * time.Millisecond)
+	if s.IsSuppressed(file) {
+		t.Error("a janela de supressão deveria ter expirado")
 	}
 }

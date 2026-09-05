@@ -1,13 +1,26 @@
 package normalizer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
 
+// maxHashableSize limita o custo de hashear arquivos grandes; acima disso a
+// entrada recai para supressão por caminho.
+const maxHashableSize = 8 << 20 // 8 MiB
+
 type suppressedItem struct {
 	expiresAt time.Time
+
+	// hash é o conteúdo que o WatchFlow gravou. Quando presente, o evento só é
+	// suprimido se o arquivo AINDA tiver esse conteúdo: se o usuário editou o
+	// mesmo arquivo dentro da janela, o evento é legítimo e deve passar.
+	hash string
 }
 
 // EchoSuppressor mantém um catálogo temporário em memória de arquivos manipulados internamente
@@ -72,25 +85,84 @@ func (s *EchoSuppressor) SuppressMultiple(paths []string, window time.Duration) 
 	}
 }
 
+// SuppressContent registra o caminho junto com o hash do seu conteúdo atual.
+// Diferente de Suppress, que cega o filtro para o caminho durante toda a janela,
+// esta variante só descarta eventos enquanto o arquivo permanecer exatamente
+// como o daemon o deixou.
+func (s *EchoSuppressor) SuppressContent(path string, window time.Duration) {
+	if path == "" {
+		return
+	}
+	if window <= 0 {
+		window = s.defaultWindow
+	}
+
+	clean := canonicalPath(path)
+	hash, err := hashFile(clean)
+	if err != nil {
+		// Não foi possível ler (arquivo removido pela operação): recai para
+		// supressão por caminho, que é o comportamento correto para remoções.
+		s.Suppress(path, window)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items[clean] = suppressedItem{expiresAt: time.Now().Add(window), hash: hash}
+}
+
+// SuppressContentMultiple aplica SuppressContent a um conjunto de caminhos.
+func (s *EchoSuppressor) SuppressContentMultiple(paths []string, window time.Duration) {
+	for _, p := range paths {
+		s.SuppressContent(p, window)
+	}
+}
+
 // IsSuppressed verifica se o caminho informado está atualmente sob a janela de supressão de eco.
 func (s *EchoSuppressor) IsSuppressed(path string) bool {
 	if path == "" {
 		return false
 	}
 
-	clean := canonicalPath(path)
 	now := time.Now()
 
+	// Caminho rápido: fora de uma sincronização o catálogo está vazio, e este é
+	// o caso da esmagadora maioria dos eventos. Evita resolver symlinks (um
+	// lstat por componente do caminho) a cada evento do kernel.
 	s.mu.RLock()
-	item, exists := s.items[clean]
+	empty := len(s.items) == 0
+	item, exists := s.items[filepath.Clean(path)]
 	s.mu.RUnlock()
+
+	if empty {
+		return false
+	}
+
+	clean := filepath.Clean(path)
+	if !exists {
+		// Só resolve o caminho canônico se a busca direta falhou
+		clean = canonicalPath(path)
+		s.mu.RLock()
+		item, exists = s.items[clean]
+		s.mu.RUnlock()
+	}
 
 	if !exists {
 		return false
 	}
 
 	if now.Before(item.expiresAt) {
-		return true
+		if item.hash == "" {
+			return true
+		}
+
+		// Conteúdo idêntico ao que o daemon gravou: é eco.
+		// Conteúdo diferente: o usuário alterou o arquivo e o evento é real.
+		current, err := hashFile(clean)
+		if err != nil {
+			return true // arquivo sumiu: eco de remoção feita pelo daemon
+		}
+		return current == item.hash
 	}
 
 	// Limpeza sob demanda do item expirado
@@ -101,6 +173,29 @@ func (s *EchoSuppressor) IsSuppressed(path string) bool {
 	s.mu.Unlock()
 
 	return false
+}
+
+// hashFile calcula o SHA-256 do conteúdo do arquivo.
+func hashFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || info.Size() > maxHashableSize {
+		return "", os.ErrInvalid
+	}
+
+	f, err := os.Open(path) // #nosec G304 -- caminho vem da árvore vigiada
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Count retorna a quantidade de itens ativos (não expirados) no catálogo.
@@ -115,6 +210,25 @@ func (s *EchoSuppressor) Count() int {
 		}
 	}
 	return len(s.items)
+}
+
+// PurgeExpired remove as entradas vencidas. Sem uma varredura periódica, um
+// caminho suprimido e nunca mais consultado permanecia no mapa indefinidamente,
+// já que a limpeza só acontecia ao consultar aquele caminho específico.
+// Retorna quantas entradas foram descartadas.
+func (s *EchoSuppressor) PurgeExpired() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	removed := 0
+	for p, item := range s.items {
+		if now.After(item.expiresAt) {
+			delete(s.items, p)
+			removed++
+		}
+	}
+	return removed
 }
 
 // Clear limpa todos os registros de supressão.

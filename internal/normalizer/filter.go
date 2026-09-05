@@ -97,12 +97,6 @@ func (f *Filter) SetEchoSuppressor(es *EchoSuppressor) {
 // ShouldIgnore avalia se o caminho especificado deve ser descartado por casamento com regras de ignore ou supressão de eco.
 func (f *Filter) ShouldIgnore(absPath string) bool {
 	cleanPath := filepath.Clean(absPath)
-
-	// 1. Checa se o arquivo foi manipulado internamente pelo daemon (Echo Suppression)
-	if f.echoSuppressor != nil && f.echoSuppressor.IsSuppressed(cleanPath) {
-		return true
-	}
-
 	slashPath := filepath.ToSlash(cleanPath)
 
 	// Proteção de segurança: eventos fora da raiz monitorada são rejeitados
@@ -114,6 +108,9 @@ func (f *Filter) ShouldIgnore(absPath string) bool {
 	relSlash := filepath.ToSlash(rel)
 	baseName := filepath.Base(cleanPath)
 
+	// Os globs são puramente aritméticos sobre strings e eliminam a esmagadora
+	// maioria dos eventos (.git/**, *.tmp). São avaliados PRIMEIRO para que o
+	// ruído nunca chegue à supressão de eco, que faz stat/leitura de disco.
 	for _, g := range f.compiledGlobs {
 		// Casamento relativo (ex: .git/index ou sub/arquivo.tmp)
 		if g.Match(relSlash) {
@@ -127,6 +124,11 @@ func (f *Filter) ShouldIgnore(absPath string) bool {
 		if g.Match(slashPath) {
 			return true
 		}
+	}
+
+	// Só agora: o arquivo foi manipulado internamente pelo daemon?
+	if f.echoSuppressor != nil && f.echoSuppressor.IsSuppressed(cleanPath) {
+		return true
 	}
 
 	return false
