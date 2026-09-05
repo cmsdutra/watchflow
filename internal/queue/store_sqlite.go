@@ -126,7 +126,18 @@ func NewSQLiteStore(dbPath string) (*Store, error) {
 }
 
 // Close encerra a conexão com o banco SQLite.
+//
+// Antes de fechar, força um checkpoint TRUNCATE. O autocheckpoint padrão (1000
+// páginas) recicla o WAL no lugar, sem nunca reduzir o arquivo: depois de
+// algumas horas de operação ele estaciona na marca d'água de ~4 MB mesmo com o
+// banco em algumas centenas de KB. TRUNCATE zera o arquivo, o que mantém o
+// state_dir enxuto e encurta a recuperação no próximo start.
+//
+// É best-effort: o checkpoint falha se ainda houver leitor ativo, e nesse caso
+// perder a truncagem é preferível a reportar um erro de encerramento que não
+// afeta a durabilidade — o WAL continua válido e é reaplicado no próximo start.
 func (s *Store) Close() error {
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	return s.db.Close()
 }
 

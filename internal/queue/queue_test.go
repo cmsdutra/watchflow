@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -362,5 +364,56 @@ func TestGetWatcherNonExistent(t *testing.T) {
 	}
 	if wName != nil {
 		t.Errorf("esperava nil para watcher inexistente por nome")
+	}
+}
+
+// TestCloseTruncatesWAL fixa o contrato de que o encerramento gracioso deixa o
+// state_dir limpo. Sem o checkpoint TRUNCATE em Close, o WAL sobrevive na marca
+// d'água do autocheckpoint (~4 MiB) mesmo com o banco em poucas centenas de KB.
+func TestCloseTruncatesWAL(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("falha ao criar SQLite store: %v", err)
+	}
+
+	// Escritas suficientes para o WAL existir com conteúdo antes do Close.
+	for i := 0; i < 50; i++ {
+		w := &WatcherRecord{
+			ID:     fmt.Sprintf("w-%d", i),
+			Name:   fmt.Sprintf("vault-%d", i),
+			Path:   fmt.Sprintf("/home/user/vault-%d", i),
+			Status: WatcherHealthy,
+		}
+		if err := store.RegisterWatcher(w); err != nil {
+			t.Fatalf("falha ao registrar watcher: %v", err)
+		}
+	}
+
+	walPath := dbPath + "-wal"
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("esperava WAL presente com o store aberto: %v", err)
+	}
+	if before.Size() == 0 {
+		t.Fatal("esperava WAL com conteúdo antes do Close")
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("falha ao fechar store: %v", err)
+	}
+
+	// TRUNCATE zera o arquivo; o driver pode ainda removê-lo ao fechar.
+	after, err := os.Stat(walPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("falha ao inspecionar WAL após Close: %v", err)
+	}
+	if after.Size() != 0 {
+		t.Errorf("esperava WAL truncado após Close, obteve %d bytes (antes: %d)", after.Size(), before.Size())
 	}
 }
