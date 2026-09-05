@@ -1,8 +1,10 @@
 package locking
 
 import (
+	"context"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // RepoLocker gerencia travas mútuas em memória por caminho canônico de repositório,
@@ -38,6 +40,29 @@ func (rl *RepoLocker) Lock(path string) func() {
 	m.Lock()
 	return func() {
 		m.Unlock()
+	}
+}
+
+// LockContext adquire a trava exclusiva do repositório respeitando o cancelamento
+// do contexto, evitando que um worker fique preso indefinidamente aguardando um
+// pipeline concorrente durante o encerramento do daemon.
+func (rl *RepoLocker) LockContext(ctx context.Context, path string) (func(), error) {
+	if unlock, ok := rl.TryLock(path); ok {
+		return unlock, nil
+	}
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if unlock, ok := rl.TryLock(path); ok {
+				return unlock, nil
+			}
+		}
 	}
 }
 

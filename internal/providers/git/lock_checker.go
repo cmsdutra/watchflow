@@ -20,13 +20,15 @@ func (a *LockCheckerAction) Name() string {
 
 // Validate valida os parâmetros opcionais da action 'git.check_locks'.
 func (a *LockCheckerAction) Validate(params map[string]interface{}) error {
-	if params == nil {
-		return nil
+	if err := rejectUnknownParams("git.check_locks", params, "max_wait", "max_wait_lock", "poll_interval"); err != nil {
+		return err
 	}
 
-	if val, ok := params["max_wait"]; ok {
-		if _, err := parseDurationParam(val); err != nil {
-			return fmt.Errorf("parâmetro 'max_wait' inválido: %w", err)
+	for _, key := range maxWaitKeys {
+		if val, ok := params[key]; ok {
+			if _, err := parseDurationParam(val); err != nil {
+				return fmt.Errorf("parâmetro '%s' inválido: %w", key, err)
+			}
 		}
 	}
 
@@ -38,6 +40,12 @@ func (a *LockCheckerAction) Validate(params map[string]interface{}) error {
 
 	return nil
 }
+
+// maxWaitKeys aceita os dois nomes em circulação: 'max_wait_lock' é o usado no
+// AGENTS.md §3.3 e na configuração canônica distribuída, enquanto o código
+// original só lia 'max_wait' — de modo que o valor configurado pelo usuário era
+// silenciosamente ignorado.
+var maxWaitKeys = []string{"max_wait", "max_wait_lock"}
 
 // Execute verifica e aguarda até que o arquivo .git/index.lock seja liberado.
 func (a *LockCheckerAction) Execute(ctx *providers.StepContext) (*providers.StepResult, error) {
@@ -60,9 +68,11 @@ func (a *LockCheckerAction) Execute(ctx *providers.StepContext) (*providers.Step
 	pollInterval := 200 * time.Millisecond
 
 	if ctx.StepParams != nil {
-		if val, ok := ctx.StepParams["max_wait"]; ok {
-			if d, err := parseDurationParam(val); err == nil && d > 0 {
-				maxWait = d
+		for _, key := range maxWaitKeys {
+			if val, ok := ctx.StepParams[key]; ok {
+				if d, err := parseDurationParam(val); err == nil && d > 0 {
+					maxWait = d
+				}
 			}
 		}
 		if val, ok := ctx.StepParams["poll_interval"]; ok {

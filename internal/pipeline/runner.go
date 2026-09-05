@@ -3,10 +3,13 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/watchflow/watchflow/internal/config"
+	"github.com/watchflow/watchflow/internal/locking"
+	"github.com/watchflow/watchflow/internal/logger"
 	"github.com/watchflow/watchflow/internal/providers"
 	"github.com/watchflow/watchflow/internal/queue"
 )
@@ -35,6 +38,11 @@ type RunResult struct {
 	Error       error
 	Category    ErrorCategory
 	StepResults map[string]*providers.StepResult
+
+	// WillRetry indica que o job foi reagendado e terá nova tentativa.
+	// Permite ao chamador distinguir uma falha transitória de uma definitiva
+	// (ex.: para não alertar o usuário a cada retry).
+	WillRetry bool
 }
 
 // Runner coordena a execução sequencial de etapas de pipeline com cancelamento e auditoria.
@@ -43,6 +51,7 @@ type Runner struct {
 	registry  *providers.Registry
 	watchers  map[string]config.WatcherConfig
 	pipelines map[string]config.Pipeline
+	log       *slog.Logger
 	mu        sync.RWMutex
 }
 
@@ -57,6 +66,7 @@ func NewRunner(store QueueStore, registry *providers.Registry, cfg *config.Confi
 		registry:  registry,
 		watchers:  make(map[string]config.WatcherConfig),
 		pipelines: make(map[string]config.Pipeline),
+		log:       logger.For("pipeline"),
 	}
 
 	if cfg != nil {
@@ -105,6 +115,12 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 	runID := fmt.Sprintf("run_%d_%s", time.Now().UnixNano(), job.ID)
 	startTime := time.Now()
 
+	runLog := r.log.With(
+		slog.String("run_id", runID),
+		slog.String("job_id", job.ID),
+		slog.String("watcher", job.WatcherID),
+		slog.String("pipeline", job.PipelineName))
+
 	// 1. Resolução do Watcher
 	watcher, err := r.resolveWatcher(job.WatcherID)
 	if err != nil {
@@ -141,8 +157,35 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 		stepRes    *providers.StepResult
 	)
 
-	// 4. Execução Sequencial dos Steps
+	basePath := watcher.ResolvedPath
+	if basePath == "" {
+		basePath = watcher.Path
+	}
+
+	// 4. Trava exclusiva da árvore de trabalho por TODA a duração do pipeline.
+	// Travar por action deixaria brechas entre steps nas quais um pipeline
+	// concorrente sobre o mesmo repositório poderia intercalar (ex.: o commit de
+	// um levaria o stage do outro), violando a garantia do AGENTS.md §3.3.
+	repoLockHeld := false
+	if basePath != "" {
+		unlockRepo, lockErr := locking.DefaultRepoLocker.LockContext(execCtx, basePath)
+		if lockErr != nil {
+			failedStep = "repo.lock"
+			stepErr = fmt.Errorf("não foi possível adquirir a trava exclusiva do repositório '%s': %w", basePath, lockErr)
+			stepRes = &providers.StepResult{TransientErr: true}
+		} else {
+			defer unlockRepo()
+			repoLockHeld = true
+		}
+	}
+
+	// 5. Execução Sequencial dos Steps
 	for _, step := range pipe.Steps {
+		// Falha na aquisição da trava aborta antes de qualquer operação em disco
+		if stepErr != nil {
+			break
+		}
+
 		// Checa se o contexto expirou antes de invocar o step
 		if err := execCtx.Err(); err != nil {
 			failedStep = step.Action
@@ -163,11 +206,6 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 			break
 		}
 
-		basePath := watcher.ResolvedPath
-		if basePath == "" {
-			basePath = watcher.Path
-		}
-
 		stepCtx := &providers.StepContext{
 			Context:      execCtx,
 			WatcherName:  watcher.Name,
@@ -176,9 +214,22 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 			StepParams:   step.Params,
 			LastOutput:   lastOutput,
 			Timestamp:    time.Now(),
+			RepoLockHeld: repoLockHeld,
 		}
 
+		stepStart := time.Now()
 		res, execErr := action.Execute(stepCtx)
+		stepLog := runLog.With(slog.String("step", step.Action), slog.Duration("duracao", time.Since(stepStart)))
+
+		switch {
+		case execErr != nil:
+			stepLog.Warn("step falhou", slog.Any("error", execErr))
+		case res != nil && res.Skipped:
+			stepLog.Debug("step pulado", slog.String("motivo", res.Output))
+		case res != nil && res.Success:
+			stepLog.Debug("step concluído", slog.String("saida", res.Output))
+		}
+
 		if execErr != nil || (res != nil && !res.Success && !res.Skipped) {
 			failedStep = step.Action
 			stepRes = res
@@ -204,7 +255,7 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 	duration := time.Since(startTime)
 	durationMs := duration.Milliseconds()
 
-	// 5. Tratamento de Falha
+	// 6. Tratamento de Falha
 	if stepErr != nil {
 		category := ClassifyError(stepErr, stepRes)
 		errMsg := stepErr.Error()
@@ -214,8 +265,29 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 			status = "BLOCKED"
 		}
 
+		willRetry := false
+		if category == CategoryTransient {
+			maxRetries := job.MaxRetries
+			if maxRetries <= 0 {
+				maxRetries = 5
+			}
+			willRetry = (job.RetryCount + 1) < maxRetries
+		}
+
+		switch category {
+		case CategoryConflict:
+			runLog.Error("CONFLITO DE MERGE: watcher interrompido até intervenção manual",
+				slog.String("step", failedStep), slog.String("detalhe", errMsg))
+		case CategoryTransient:
+			runLog.Warn("falha transitória; job será retentado",
+				slog.String("step", failedStep), slog.String("detalhe", errMsg))
+		default:
+			runLog.Error("falha fatal do pipeline",
+				slog.String("step", failedStep), slog.String("detalhe", errMsg))
+		}
+
 		if r.store != nil {
-			_ = r.store.RecordPipelineRun(&queue.PipelineRun{
+			if err := r.store.RecordPipelineRun(&queue.PipelineRun{
 				ID:           runID,
 				JobID:        job.ID,
 				WatcherID:    job.WatcherID,
@@ -224,24 +296,39 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 				DurationMs:   durationMs,
 				ErrorStep:    failedStep,
 				ErrorDetails: errMsg,
-			})
+			}); err != nil {
+				runLog.Error("falha ao registrar auditoria da execução", slog.Any("error", err))
+			}
 
 			switch category {
 			case CategoryConflict:
-				_ = r.store.MarkJobBlocked(job.ID, errMsg)
-				_ = r.store.UpdateWatcherStatus(job.WatcherID, queue.WatcherConflictHalted, errMsg)
-			case CategoryTransient:
-				maxRetries := job.MaxRetries
-				if maxRetries <= 0 {
-					maxRetries = 5
+				if err := r.store.MarkJobBlocked(job.ID, errMsg); err != nil {
+					runLog.Error("falha ao marcar job como BLOCKED", slog.Any("error", err))
 				}
-				canRetry := (job.RetryCount + 1) < maxRetries
-				backoff := CalculateBackoff(job.RetryCount)
-				_ = r.store.MarkJobFailed(job.ID, errMsg, canRetry, backoff)
-				_ = r.store.UpdateWatcherStatus(job.WatcherID, queue.WatcherDegraded, errMsg)
+				if err := r.store.UpdateWatcherStatus(job.WatcherID, queue.WatcherConflictHalted, errMsg); err != nil {
+					runLog.Error("falha ao marcar watcher como CONFLICT_HALTED", slog.Any("error", err))
+				}
+			case CategoryTransient:
+				canRetry := willRetry
+				profile := ClassifyBackoff(stepErr, stepRes)
+				backoff := BackoffFor(profile, job.RetryCount)
+				runLog.Info("reagendando job",
+					slog.Bool("pode_retentar", canRetry),
+					slog.String("perfil_espera", profile.String()),
+					slog.Duration("backoff", backoff))
+				if err := r.store.MarkJobFailed(job.ID, errMsg, canRetry, backoff); err != nil {
+					runLog.Error("falha ao reagendar job para retry", slog.Any("error", err))
+				}
+				if err := r.store.UpdateWatcherStatus(job.WatcherID, queue.WatcherDegraded, errMsg); err != nil {
+					runLog.Error("falha ao marcar watcher como DEGRADED", slog.Any("error", err))
+				}
 			case CategoryFatal:
-				_ = r.store.MarkJobFailed(job.ID, errMsg, false, 0)
-				_ = r.store.UpdateWatcherSyncTime(job.WatcherID, false, errMsg)
+				if err := r.store.MarkJobFailed(job.ID, errMsg, false, 0); err != nil {
+					runLog.Error("falha ao marcar job como FAILED", slog.Any("error", err))
+				}
+				if err := r.store.UpdateWatcherSyncTime(job.WatcherID, false, errMsg); err != nil {
+					runLog.Error("falha ao registrar horário da última falha", slog.Any("error", err))
+				}
 			}
 		}
 
@@ -255,22 +342,32 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 			ErrorStep:   failedStep,
 			Error:       stepErr,
 			Category:    category,
+			WillRetry:   willRetry,
 			StepResults: jobCtx.StepResults,
 		}, stepErr
 	}
 
-	// 6. Sucesso Completo
+	// 7. Sucesso Completo
+	runLog.Info("pipeline concluído", slog.Duration("duracao", duration), slog.Int("steps", len(pipe.Steps)))
+
 	if r.store != nil {
-		_ = r.store.RecordPipelineRun(&queue.PipelineRun{
+		if err := r.store.RecordPipelineRun(&queue.PipelineRun{
 			ID:           runID,
 			JobID:        job.ID,
 			WatcherID:    job.WatcherID,
 			PipelineName: job.PipelineName,
 			Status:       "SUCCESS",
 			DurationMs:   durationMs,
-		})
-		_ = r.store.MarkJobCompleted(job.ID)
-		_ = r.store.UpdateWatcherSyncTime(job.WatcherID, true, "")
+		}); err != nil {
+			runLog.Error("falha ao registrar auditoria da execução bem-sucedida", slog.Any("error", err))
+		}
+		if err := r.store.MarkJobCompleted(job.ID); err != nil {
+			// Job ficaria preso em RUNNING e seria reprocessado no próximo boot
+			runLog.Error("falha ao marcar job como COMPLETED", slog.Any("error", err))
+		}
+		if err := r.store.UpdateWatcherSyncTime(job.WatcherID, true, ""); err != nil {
+			runLog.Error("falha ao registrar horário do último sucesso", slog.Any("error", err))
+		}
 	}
 
 	return &RunResult{
@@ -335,8 +432,15 @@ func (r *Runner) failRunImmediately(
 	durationMs := duration.Milliseconds()
 	errMsg := err.Error()
 
+	r.log.Error("job abortado antes da execução dos steps",
+		slog.String("run_id", runID),
+		slog.String("job_id", job.ID),
+		slog.String("watcher", job.WatcherID),
+		slog.String("pipeline", job.PipelineName),
+		slog.String("detalhe", errMsg))
+
 	if r.store != nil {
-		_ = r.store.RecordPipelineRun(&queue.PipelineRun{
+		if recErr := r.store.RecordPipelineRun(&queue.PipelineRun{
 			ID:           runID,
 			JobID:        job.ID,
 			WatcherID:    job.WatcherID,
@@ -345,8 +449,12 @@ func (r *Runner) failRunImmediately(
 			DurationMs:   durationMs,
 			ErrorStep:    failedStep,
 			ErrorDetails: errMsg,
-		})
-		_ = r.store.MarkJobFailed(job.ID, errMsg, false, 0)
+		}); recErr != nil {
+			r.log.Error("falha ao registrar auditoria da execução", slog.Any("error", recErr))
+		}
+		if markErr := r.store.MarkJobFailed(job.ID, errMsg, false, 0); markErr != nil {
+			r.log.Error("falha ao marcar job como FAILED", slog.Any("error", markErr))
+		}
 	}
 
 	return &RunResult{

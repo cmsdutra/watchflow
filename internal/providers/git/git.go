@@ -4,19 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/watchflow/watchflow/internal/locking"
+	"github.com/watchflow/watchflow/internal/logger"
 	"github.com/watchflow/watchflow/internal/providers"
-)
-
-var (
-	// credRegex sanitiza credenciais embutidas em URLs Git para evitar vazamento em logs
-	credRegex = regexp.MustCompile(`https?://[^/@\s]+@`)
 )
 
 func init() {
@@ -53,12 +51,17 @@ func (a *AddAction) Name() string {
 
 // Validate valida os parâmetros opcionais da action 'git.add'.
 func (a *AddAction) Validate(params map[string]interface{}) error {
-	if params == nil {
-		return nil
+	if err := rejectUnknownParams("git.add", params, "pathspec", "all"); err != nil {
+		return err
 	}
 	if val, ok := params["pathspec"]; ok {
 		if _, ok := val.(string); !ok {
 			return fmt.Errorf("parâmetro 'pathspec' deve ser uma string")
+		}
+	}
+	if val, ok := params["all"]; ok {
+		if _, ok := val.(bool); !ok {
+			return fmt.Errorf("parâmetro 'all' deve ser um booleano")
 		}
 	}
 	return nil
@@ -70,8 +73,12 @@ func (a *AddAction) Execute(ctx *providers.StepContext) (*providers.StepResult, 
 		return nil, fmt.Errorf("caminho base do repositório não fornecido")
 	}
 
-	unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
-	defer unlock()
+	// Quando executada isoladamente (fora de um pipeline), a action garante ela
+	// mesma a exclusão mútua sobre a árvore Git.
+	if !ctx.RepoLockHeld {
+		unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
+		defer unlock()
+	}
 
 	// 1. Inspeciona o status atual da árvore de trabalho
 	statusOut, err := runGit(ctx.Context, ctx.BasePath, "status", "--porcelain")
@@ -102,15 +109,35 @@ func (a *AddAction) Execute(ctx *providers.StepContext) (*providers.StepResult, 
 		}
 	}
 
-	// 3. Executa git add
-	pathspec := "-A"
+	// 3. Monta os argumentos de 'git add'
+	args := []string{"add"}
+	pathspec := ""
 	if ctx.StepParams != nil {
 		if customPath, ok := ctx.StepParams["pathspec"].(string); ok && customPath != "" {
 			pathspec = customPath
 		}
 	}
 
-	addOut, err := runGit(ctx.Context, ctx.BasePath, "add", pathspec)
+	switch {
+	case pathspec != "":
+		args = append(args, pathspec)
+	case ctx.StepParams != nil && ctx.StepParams["all"] == false:
+		// all:false restringe o stage aos arquivos do lote que originou o job,
+		// em vez de varrer a árvore inteira.
+		if len(ctx.ChangedFiles) == 0 {
+			return &providers.StepResult{
+				Success: true,
+				Skipped: true,
+				Output:  "all:false sem arquivos no lote; nada a adicionar",
+			}, nil
+		}
+		args = append(args, "--")
+		args = append(args, ctx.ChangedFiles...)
+	default:
+		args = append(args, "-A")
+	}
+
+	addOut, err := runGit(ctx.Context, ctx.BasePath, args...)
 	if err != nil {
 		return &providers.StepResult{
 			Success:      false,
@@ -140,12 +167,17 @@ func (a *CommitAction) Name() string {
 
 // Validate valida os parâmetros opcionais da action 'git.commit'.
 func (a *CommitAction) Validate(params map[string]interface{}) error {
-	if params == nil {
-		return nil
+	if err := rejectUnknownParams("git.commit", params, "message", "allow_empty"); err != nil {
+		return err
 	}
 	if val, ok := params["message"]; ok {
 		if _, ok := val.(string); !ok {
 			return fmt.Errorf("parâmetro 'message' deve ser uma string")
+		}
+	}
+	if val, ok := params["allow_empty"]; ok {
+		if _, ok := val.(bool); !ok {
+			return fmt.Errorf("parâmetro 'allow_empty' deve ser um booleano")
 		}
 	}
 	return nil
@@ -157,12 +189,23 @@ func (a *CommitAction) Execute(ctx *providers.StepContext) (*providers.StepResul
 		return nil, fmt.Errorf("caminho base do repositório não fornecido")
 	}
 
-	unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
-	defer unlock()
+	// Quando executada isoladamente (fora de um pipeline), a action garante ela
+	// mesma a exclusão mútua sobre a árvore Git.
+	if !ctx.RepoLockHeld {
+		unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
+		defer unlock()
+	}
+
+	allowEmpty := false
+	if ctx.StepParams != nil {
+		if v, ok := ctx.StepParams["allow_empty"].(bool); ok {
+			allowEmpty = v
+		}
+	}
 
 	// 1. Verifica se há algo staged via git diff --cached --quiet
 	_, diffErr := runGit(ctx.Context, ctx.BasePath, "diff", "--cached", "--quiet")
-	if diffErr == nil {
+	if diffErr == nil && !allowEmpty {
 		// Código de saída 0 significa que não há alterações staged
 		return &providers.StepResult{
 			Success: true,
@@ -182,7 +225,11 @@ func (a *CommitAction) Execute(ctx *providers.StepContext) (*providers.StepResul
 	commitMsg := formatCommitMessage(msgTemplate, ctx)
 
 	// 3. Executa o commit
-	commitOut, err := runGit(ctx.Context, ctx.BasePath, "commit", "-m", commitMsg)
+	commitArgs := []string{"commit", "-m", commitMsg}
+	if allowEmpty {
+		commitArgs = append(commitArgs, "--allow-empty")
+	}
+	commitOut, err := runGit(ctx.Context, ctx.BasePath, commitArgs...)
 	if err != nil {
 		return &providers.StepResult{
 			Success:      false,
@@ -200,6 +247,34 @@ func (a *CommitAction) Execute(ctx *providers.StepContext) (*providers.StepResul
 		Success: true,
 		Output:  commitOut,
 	}, nil
+}
+
+// rejectUnknownParams reprova chaves não reconhecidas em 'params'. Sem isso, um
+// parâmetro digitado errado era silenciosamente ignorado e o usuário acreditava
+// ter configurado algo que nunca teve efeito.
+func rejectUnknownParams(action string, params map[string]interface{}, allowed ...string) error {
+	if params == nil {
+		return nil
+	}
+
+	valid := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		valid[a] = true
+	}
+
+	var unknown []string
+	for k := range params {
+		if !valid[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	sort.Strings(unknown)
+	return fmt.Errorf("parâmetro(s) desconhecido(s) em '%s': %s; aceitos: %s",
+		action, strings.Join(unknown, ", "), strings.Join(allowed, ", "))
 }
 
 func runGit(ctx context.Context, repoDir string, args ...string) (string, error) {
@@ -221,9 +296,24 @@ func runGit(ctx context.Context, repoDir string, args ...string) (string, error)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	started := time.Now()
 	runErr := cmd.Run()
+	elapsed := time.Since(started)
+
 	out := sanitizeOutput(strings.TrimSpace(stdout.String()))
 	errOut := sanitizeOutput(strings.TrimSpace(stderr.String()))
+
+	log := logger.For("git").With(
+		slog.String("repo", cleanDir),
+		slog.String("args", strings.Join(args, " ")),
+		slog.Duration("elapsed", elapsed),
+	)
+
+	if runErr != nil {
+		log.Debug("comando git falhou", slog.String("stderr", errOut), slog.Any("error", runErr))
+	} else {
+		log.Debug("comando git executado", slog.String("stdout", out))
+	}
 
 	if runErr != nil {
 		errMsg := errOut
@@ -240,17 +330,24 @@ func runGit(ctx context.Context, repoDir string, args ...string) (string, error)
 }
 
 // SanitizeGitOutput remove tokens e senhas de URLs Git em mensagens e logs.
+// Delega ao catálogo central de padrões de segredo do pacote logger, de modo que
+// a supressão exigida pelo AGENTS.md §3.5 tenha uma única fonte de verdade.
 func SanitizeGitOutput(s string) string {
-	return credRegex.ReplaceAllString(s, "https://***@")
+	return logger.Redact(s)
 }
 
 func sanitizeOutput(s string) string {
 	return SanitizeGitOutput(s)
 }
 
+// doubleBraceRe normaliza a sintaxe {{var}} para {var}. A configuração canônica
+// distribuída usava chaves duplas, que a substituição simples deixava passar e
+// produzia commits com o literal "{2026-01-01 10:00:00}" na mensagem.
+var doubleBraceRe = regexp.MustCompile(`\{\{(\w+)\}\}`)
+
 func formatCommitMessage(template string, ctx *providers.StepContext) string {
 	now := time.Now()
-	msg := template
+	msg := doubleBraceRe.ReplaceAllString(template, "{$1}")
 	msg = strings.ReplaceAll(msg, "{timestamp}", now.Format("2006-01-02 15:04:05"))
 	msg = strings.ReplaceAll(msg, "<timestamp>", now.Format("2006-01-02 15:04:05"))
 	msg = strings.ReplaceAll(msg, "{iso_timestamp}", now.Format(time.RFC3339))

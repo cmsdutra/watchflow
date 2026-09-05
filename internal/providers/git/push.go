@@ -22,8 +22,8 @@ func (a *PushAction) Name() string {
 
 // Validate valida os parâmetros opcionais da action 'git.push'.
 func (a *PushAction) Validate(params map[string]interface{}) error {
-	if params == nil {
-		return nil
+	if err := rejectUnknownParams("git.push", params, "remote", "branch", "set_upstream"); err != nil {
+		return err
 	}
 	if val, ok := params["remote"]; ok {
 		if _, ok := val.(string); !ok {
@@ -49,8 +49,12 @@ func (a *PushAction) Execute(ctx *providers.StepContext) (*providers.StepResult,
 		return nil, fmt.Errorf("caminho base do repositório não fornecido")
 	}
 
-	unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
-	defer unlock()
+	// Quando executada isoladamente (fora de um pipeline), a action garante ela
+	// mesma a exclusão mútua sobre a árvore Git.
+	if !ctx.RepoLockHeld {
+		unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
+		defer unlock()
+	}
 
 	// 1. Identifica o remote alvo (padrão: "origin")
 	remote := "origin"

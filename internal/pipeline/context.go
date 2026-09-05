@@ -153,6 +153,86 @@ func ClassifyError(err error, res *providers.StepResult) ErrorCategory {
 	return CategoryFatal
 }
 
+// BackoffProfile distingue a natureza da espera antes de uma nova tentativa.
+type BackoffProfile int
+
+const (
+	// BackoffNetwork trata indisponibilidade (rede fora, host inacessível,
+	// trava externa). Recuar agressivamente evita martelar um recurso morto.
+	BackoffNetwork BackoffProfile = iota
+	// BackoffContention trata a corrida com outra máquina: o push foi rejeitado
+	// porque o remoto avançou. Não há nada quebrado — basta refazer o
+	// safe_sync e reenviar. Recuar exponencialmente aqui só atrasa a
+	// convergência entre dois dispositivos ativos.
+	BackoffContention
+)
+
+// String retorna a representação textual do perfil de espera.
+func (b BackoffProfile) String() string {
+	if b == BackoffContention {
+		return "CONTENTION"
+	}
+	return "NETWORK"
+}
+
+// contentionIndicators marcam rejeições por avanço do remoto, e não por falha.
+var contentionIndicators = []string{
+	"non-fast-forward",
+	"fetch first",
+	"[rejected]",
+	"updates were rejected",
+	"tip of your current branch is behind",
+}
+
+// ClassifyBackoff decide o perfil de espera de uma falha transitória.
+func ClassifyBackoff(err error, res *providers.StepResult) BackoffProfile {
+	var text string
+	if err != nil {
+		text = err.Error()
+	}
+	if res != nil && res.ErrorMessage != "" {
+		text += " " + res.ErrorMessage
+	}
+
+	lower := strings.ToLower(text)
+	for _, indicator := range contentionIndicators {
+		if strings.Contains(lower, indicator) {
+			return BackoffContention
+		}
+	}
+	return BackoffNetwork
+}
+
+// BackoffFor calcula a espera adequada ao perfil da falha.
+func BackoffFor(profile BackoffProfile, retryCount int) time.Duration {
+	if profile == BackoffContention {
+		return calculateContentionBackoff(retryCount)
+	}
+	return CalculateBackoff(retryCount)
+}
+
+// calculateContentionBackoff usa base curta e teto baixo:
+// T_wait = min(15s, 1s * 2^retry + rand(0, 500ms)).
+func calculateContentionBackoff(retryCount int) time.Duration {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	if retryCount > 4 {
+		retryCount = 4
+	}
+
+	base := time.Duration(1<<retryCount) * time.Second
+	jitter := time.Duration(rand.IntN(500)) * time.Millisecond
+
+	if backoff := base + jitter; backoff < maxContentionBackoff {
+		return backoff
+	}
+	return maxContentionBackoff
+}
+
+// maxContentionBackoff limita a espera em disputas com outra máquina.
+const maxContentionBackoff = 15 * time.Second
+
 // CalculateBackoff calcula o tempo de espera com backoff exponencial e jitter:
 // T_wait = min(300s, 5s * 2^retry + rand(0, 3s)).
 func CalculateBackoff(retryCount int) time.Duration {

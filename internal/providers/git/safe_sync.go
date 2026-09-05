@@ -14,6 +14,14 @@ import (
 	"github.com/watchflow/watchflow/internal/providers"
 )
 
+const (
+	// preOpSuppressWindow cobre a duração da operação git que reescreve a árvore.
+	preOpSuppressWindow = 15 * time.Second
+	// echoTailWindow é o resíduo mantido após a operação para os eventos que o
+	// kernel ainda estiver entregando.
+	echoTailWindow = 2 * time.Second
+)
+
 func init() {
 	_ = providers.Register(&SafeSyncAction{})
 }
@@ -30,8 +38,8 @@ func (a *SafeSyncAction) Name() string {
 
 // Validate valida os parâmetros opcionais da action 'git.safe_sync'.
 func (a *SafeSyncAction) Validate(params map[string]interface{}) error {
-	if params == nil {
-		return nil
+	if err := rejectUnknownParams("git.safe_sync", params, "remote", "branch"); err != nil {
+		return err
 	}
 	if val, ok := params["remote"]; ok {
 		if _, ok := val.(string); !ok {
@@ -52,8 +60,12 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 		return nil, fmt.Errorf("caminho base do repositório não fornecido")
 	}
 
-	unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
-	defer unlock()
+	// Quando executada isoladamente (fora de um pipeline), a action garante ela
+	// mesma a exclusão mútua sobre a árvore Git.
+	if !ctx.RepoLockHeld {
+		unlock := locking.DefaultRepoLocker.Lock(ctx.BasePath)
+		defer unlock()
+	}
 
 	// 1. Identifica o remote alvo (padrão: "origin")
 	remote := "origin"
@@ -163,6 +175,11 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 		}, fmt.Errorf("contagem inválida: %s", revListOut)
 	}
 
+	// A partir daqui a árvore pode ser reescrita (merge, fast-forward ou abort):
+	// a janela de supressão de eco precisa estar aberta ANTES da mutação.
+	planned := a.planEchoSuppression(ctx.Context, ctx.BasePath, remoteRef)
+	defer releaseEchoSuppression(planned)
+
 	// Caso A: Em sincronia perfeita
 	if behind == 0 && ahead == 0 {
 		return &providers.StepResult{
@@ -188,7 +205,6 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 				ErrorMessage: fmt.Sprintf("fast-forward falhou inesperadamente: %v", ffErr),
 			}, ffErr
 		}
-		a.suppressEchoChanges(ctx.Context, ctx.BasePath)
 		return &providers.StepResult{
 			Success: true,
 			Output:  fmt.Sprintf("fast-forward concluído com sucesso (%d commits integrados): %s", behind, ffOut),
@@ -198,7 +214,6 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 	// Caso D: Divergência paralela (behind > 0 && ahead > 0) — Tenta merge seguro sem edição
 	mergeOut, mergeErr := runGit(ctx.Context, ctx.BasePath, "merge", "--no-edit", remoteRef)
 	if mergeErr == nil {
-		a.suppressEchoChanges(ctx.Context, ctx.BasePath)
 		// Merge automático de três vias concluído com sucesso e sem conflitos de linhas
 		return &providers.StepResult{
 			Success: true,
@@ -226,21 +241,40 @@ func (a *SafeSyncAction) Execute(ctx *providers.StepContext) (*providers.StepRes
 	}, providers.ErrConflict
 }
 
-func (a *SafeSyncAction) suppressEchoChanges(ctx context.Context, basePath string) {
-	diffOut, err := runGit(ctx, basePath, "diff", "--name-only", "ORIG_HEAD", "HEAD")
+// planEchoSuppression calcula, ANTES de qualquer mutação, quais arquivos a
+// sincronização vai reescrever e abre a janela de supressão de eco para eles.
+//
+// Suprimir depois do merge chega tarde: o kernel já emitiu os eventos enquanto
+// o git escrevia, e eles podem ter atravessado o filtro. Isso vale igualmente
+// para 'git merge --abort', que também reescreve a árvore — e cujo eco
+// realimentava o pipeline em repositórios com conflito.
+func (a *SafeSyncAction) planEchoSuppression(ctx context.Context, basePath, remoteRef string) []string {
+	diffOut, err := runGit(ctx, basePath, "diff", "--name-only", "HEAD", remoteRef)
 	if err != nil || strings.TrimSpace(diffOut) == "" {
-		return
+		return nil
 	}
 
 	var fullPaths []string
 	for _, f := range strings.Split(strings.TrimSpace(diffOut), "\n") {
-		trimmed := strings.TrimSpace(f)
-		if trimmed != "" {
+		if trimmed := strings.TrimSpace(f); trimmed != "" {
 			fullPaths = append(fullPaths, filepath.Join(basePath, trimmed))
 		}
 	}
 
 	if len(fullPaths) > 0 {
-		normalizer.DefaultEchoSuppressor.SuppressMultiple(fullPaths, 2*time.Second)
+		normalizer.DefaultEchoSuppressor.SuppressMultiple(fullPaths, preOpSuppressWindow)
+	}
+	return fullPaths
+}
+
+// releaseEchoSuppression encurta a janela aberta por planEchoSuppression assim
+// que a operação termina, deixando apenas o rabo curto necessário para os
+// últimos eventos em trânsito. Sem isso, uma janela longa engoliria edições
+// legítimas do usuário nos mesmos arquivos.
+func releaseEchoSuppression(paths []string) {
+	if len(paths) > 0 {
+		// Por conteúdo: se o usuário editou algum destes arquivos enquanto a
+		// sincronização rodava, o evento dele não pode ser confundido com eco.
+		normalizer.DefaultEchoSuppressor.SuppressContentMultiple(paths, echoTailWindow)
 	}
 }

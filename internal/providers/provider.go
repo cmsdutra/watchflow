@@ -25,6 +25,11 @@ type StepContext struct {
 	StepParams   map[string]interface{}
 	LastOutput   string
 	Timestamp    time.Time
+
+	// RepoLockHeld indica que o chamador já detém a trava exclusiva de BasePath
+	// por toda a duração do pipeline. As actions não devem readquiri-la, sob pena
+	// de auto-deadlock (sync.Mutex não é reentrante).
+	RepoLockHeld bool
 }
 
 // StepResult encapsula o resultado estruturado da execução de um step.
@@ -83,6 +88,20 @@ func (r *Registry) Register(provider ActionProvider) error {
 	return nil
 }
 
+// Unregister remove uma ação do catálogo. Retorna true se ela existia.
+// Necessário para que testes que registram no catálogo global possam se limpar,
+// tornando a suíte idempotente entre execuções repetidas no mesmo processo.
+func (r *Registry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.actions[name]; !exists {
+		return false
+	}
+	delete(r.actions, name)
+	return true
+}
+
 // Get busca uma ação pelo nome no catálogo.
 func (r *Registry) Get(name string) (ActionProvider, bool) {
 	r.mu.RLock()
@@ -113,4 +132,9 @@ func Register(provider ActionProvider) error {
 // Get busca uma ação no catálogo global DefaultRegistry.
 func Get(name string) (ActionProvider, bool) {
 	return DefaultRegistry.Get(name)
+}
+
+// Unregister remove uma ação do catálogo global DefaultRegistry.
+func Unregister(name string) bool {
+	return DefaultRegistry.Unregister(name)
 }
