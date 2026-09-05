@@ -247,8 +247,18 @@ watchflow doctor
 ```
 
 Ele verifica se o Git está instalado, se os limites do kernel para monitoramento
-de arquivos são suficientes para o tamanho da sua pasta, e se os diretórios de
-trabalho estão acessíveis. Se algo estiver errado, ele diz o que fazer.
+de arquivos são suficientes para o tamanho da sua pasta, se os diretórios de
+trabalho estão acessíveis e se o serviço systemd está saudável. Se algo estiver
+errado, ele diz o que fazer.
+
+Duas checagens merecem atenção porque cobrem falhas que **não aparecem no log**:
+
+- **Serviço.** Um daemon iniciado à mão no terminal morre junto com a janela, sem
+  deixar registro. Se o `doctor` avisar que a unidade não está instalada, ou que
+  está em loop de reinício, é esse o problema — e o log não vai te contar.
+- **Merge drivers.** Se o `.gitattributes` do cofre nomeia um driver que este
+  clone não define, o `doctor` avisa antes do primeiro conflito. Veja
+  [Arquivos que conflitam sempre](#arquivos-que-conflitam-sempre).
 
 O problema mais comum é o limite de arquivos monitorados. Se o `doctor`
 reclamar disso:
@@ -325,6 +335,23 @@ pipelines:
       - action: "git.safe_sync"
       - action: "git.push"
 ```
+
+Dois campos merecem explicação, porque o nome sugere mais do que fazem:
+
+**`ignore` filtra eventos, não o Git.** Ele decide o que **dispara** uma
+sincronização — um arquivo listado ali não acorda o daemon. Mas se esse arquivo
+já é rastreado pelo Git, ele continua entrando nos commits normalmente, porque
+quem monta o commit é o `git add` do pipeline, não o watcher. Para excluir um
+arquivo do versionamento, use `.gitignore` (e `git rm --cached`, se ele já
+estiver rastreado).
+
+**`pull_interval` domina a latência de espelhamento.** Uma edição na máquina A
+chega na máquina B em dois saltos: publicar (≈ `debounce` + alguns segundos de
+pipeline) e a outra máquina descobrir (em média *metade* do `pull_interval`). Com
+os padrões, são ~17s no primeiro salto e ~2min30s no segundo — ou seja, baixar o
+`debounce` quase não muda nada, e baixar o `pull_interval` muda quase tudo. O
+mínimo aceito é 30s; cada consulta é uma ida à rede, então valores agressivos
+custam tráfego em cofres grandes.
 
 Depois de editar, valide antes de rodar:
 
@@ -495,6 +522,39 @@ watchflow resume meu-cofre
 
 O `resume` é a sua confirmação de que está tudo certo. Até você rodar esse
 comando, o WatchFlow não mexe nessa pasta.
+
+### Arquivos que conflitam sempre
+
+Alguns arquivos mudam sozinhos, de forma diferente em cada máquina, e não têm
+como ser mesclados linha a linha. O caso clássico é o estado de interface do
+Obsidian (`.obsidian/workspace.json`): ele guarda layout de painéis e último
+arquivo aberto, muda a cada clique, e duas máquinas sempre divergem nele. Se ele
+for versionado, o conflito é questão de tempo, não de azar.
+
+Há dois caminhos. O primeiro é parar de versioná-lo, com `.gitignore` mais
+`git rm --cached` — simples, mas você perde a sincronização daquele estado.
+
+O segundo mantém a sincronização e resolve o empate por regra fixa, com um merge
+driver que sempre adota a versão remota:
+
+```bash
+# no repositório, uma vez por máquina
+git config --local merge.theirs.name "sempre usa a versao remota"
+git config --local merge.theirs.driver "cp %B %A"
+```
+
+```gitattributes
+# .gitattributes, versionado junto com o cofre
+.obsidian/workspace.json merge=theirs
+.obsidian/appearance.json merge=theirs
+```
+
+**Atenção ao detalhe que causa surpresa:** o `.gitattributes` é versionado e
+chega junto com o clone, mas a definição do driver mora no `git config --local`
+e **não viaja**. Num clone novo só a primeira metade existe, e o Git não avisa —
+ele volta em silêncio ao merge de texto padrão e produz exatamente o conflito
+que a configuração deveria evitar. Cada máquina precisa rodar o `git config` uma
+vez. O `watchflow doctor` verifica isso.
 
 ### Não está sincronizando
 

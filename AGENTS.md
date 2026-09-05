@@ -105,7 +105,7 @@ watchflow/
 │       ├── pause.go              # watchflow pause (congelar captura de eventos)
 │       ├── resume.go             # watchflow resume (descongelar captura)
 │       ├── logs.go               # watchflow logs (tail do log JSON)
-│       ├── doctor.go             # watchflow doctor (checagem de limites e dependências)
+│       ├── doctor.go             # watchflow doctor (ambiente, serviço, merge drivers, SQLite)
 │       └── config_cmd.go         # watchflow config validate
 ├── internal/
 │   ├── config/                   # Leitura, parsing e validação de schema YAML
@@ -250,7 +250,7 @@ Consulte os detalhes completos de cada ticket em [Plano de Implementação - Wat
 | **WF-011** | Fase 5 | Supressão de Eco de Eventos | WF-009 | `internal/normalizer/echo_suppressor.go` | Arquivos alterados por `git pull` interno não geram novos jobs de commit recursivos. |
 | **WF-012** | Fase 6 | Recuperador pós-crash no startup | WF-010, WF-011 | `internal/core/recovery.go` | Jobs deixados em `RUNNING` por queda de energia voltam para `PENDING` ao reiniciar. |
 | **WF-013** | Fase 7 | Servidor IPC e Comandos CLI básicos | WF-012 | `internal/ipc/server.go`, `client.go`, `cmd/watchflow/status.go`, `pause.go` | `watchflow status` exibe tabela de repositórios, métricas e fila via Unix socket. |
-| **WF-014** | Fase 7 | Comando `watchflow doctor` | WF-013 | `cmd/watchflow/doctor.go` | Checa limites de inotify no kernel, integridade do SQLite e versão do Git. |
+| **WF-014** | Fase 7 | Comando `watchflow doctor` | WF-013 | `cmd/watchflow/doctor.go` | Checa limites de inotify no kernel, versão do Git, integridade e tamanho do WAL do SQLite, merge drivers referenciados pelo `.gitattributes` de cada cofre, a unidade systemd do usuário e o socket do daemon. |
 | **WF-015** | Fase 8 | Serviço systemd --user e hardening | WF-014 | `deploy/systemd/watchflow.service`, `cmd/watchflow/start.go` | Inicia via `systemctl --user`; encerra limpo com `SIGTERM` sem corromper o banco. |
 | **WF-016** | Fase 9 | Teste E2E e Homologação do MVP | WF-015 | `tests/integration/mvp_demo_test.go` | Suíte automatizada valida o roteiro completo de demonstração offline/online. |
 
