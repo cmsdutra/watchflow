@@ -597,9 +597,10 @@ programa parado, o que ajuda a investigar por que ele parou.
 
 Vale saber antes de adotar:
 
-- **Só Linux.** O código depende de `inotify`, sockets Unix e `systemd --user`.
-  Windows e macOS exigiriam trabalho de portabilidade, documentado em
-  [`Plano de Implementação - TUI.md`](Plano%20de%20Implementação%20-%20TUI.md).
+- **Só Linux.** O daemon assume `inotify`, sockets Unix e `systemd --user`. O
+  código compila para Windows sem alteração, mas não foi testado lá e há
+  comportamento que difere em silêncio — o caminho está mapeado em
+  [`docs/plano-windows.md`](docs/plano-windows.md). macOS não foi avaliado.
 - **Só Git.** A arquitetura prevê outros destinos (WebDAV, S3, rsync), mas
   apenas o Git está implementado.
 - **Sem resolução automática de conflitos**, por decisão de projeto. Quando duas
