@@ -55,28 +55,37 @@ com uma regra acima de todas as outras: **nunca perder o seu trabalho**.
 
 ## Como funciona
 
-Quando você salva um arquivo, acontece o seguinte:
+O daemon fica parado até algo acontecer. Três coisas podem acioná-lo:
+
+| Gatilho | Quando |
+|---|---|
+| Você edita um arquivo | ~15s depois (agrupando edições em rajada) |
+| Relógio interno | a cada 5 minutos |
+| O daemon acabou de subir | ~3 segundos depois |
+
+Nos três casos ele executa o mesmo ciclo:
 
 ```
-Você salva um arquivo
-        ↓
-O kernel avisa o WatchFlow (inotify)
-        ↓
+Gatilho
+   ↓
 Filtros descartam ruído (.git/, arquivos temporários)
-        ↓
-Espera 15s de silêncio para agrupar edições em rajada
-        ↓
+   ↓
 Grava a intenção de sincronizar no banco local (SQLite)
-        ↓
-Executa: git add → git commit → sincroniza → git push
+   ↓
+git add → git commit → traz do remoto → git push
 ```
 
-Dois detalhes importantes desse fluxo:
+Três detalhes que valem entender:
 
-**A espera de 15 segundos** existe para não gerar um commit a cada tecla salva.
-Se você salvar cinco arquivos em dez segundos, tudo vira um commit só. Há também
+**A espera de 15 segundos** existe para não gerar um commit a cada arquivo
+salvo. Se você salvar cinco arquivos em dez segundos, tudo vira um commit só. Há
 um teto (60s por padrão) para que edições contínuas não adiem a sincronização
 indefinidamente.
+
+**A verificação periódica** existe porque tudo o mais parte de eventos locais.
+Sem ela, o que outra máquina publicasse só chegaria quando você editasse algo —
+e você poderia acabar editando em cima de uma versão desatualizada. Ela é
+controlada por `pull_interval` e pode ser desligada.
 
 **A intenção é gravada em disco antes de qualquer coisa acontecer.** Se faltar
 energia no meio de um `git push`, o trabalho pendente não se perde: na próxima
@@ -425,12 +434,18 @@ processadas quando você retomar. Nada é descartado.
 
 ## Rodando como serviço
 
-Para que ele suba junto com sua sessão, use o systemd do usuário:
+Se você usou `./install.sh`, isso já foi feito — o script instala a unit do
+systemd. Para habilitar:
+
+```bash
+systemctl --user enable --now watchflow
+```
+
+Instalação manual da unit, se preferir:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/systemd/watchflow.service ~/.config/systemd/user/
-
 systemctl --user daemon-reload
 systemctl --user enable --now watchflow
 ```
@@ -442,11 +457,21 @@ systemctl --user status watchflow
 journalctl --user -u watchflow -f
 ```
 
-Se quiser que continue rodando mesmo com você deslogado do ambiente gráfico:
+### Login ou boot da máquina?
+
+Por padrão, **no seu login** — não no boot. Se a máquina liga mas ninguém entra
+na sessão, o WatchFlow não sobe.
+
+Para que ele rode desde o boot, independentemente de haver alguém logado:
 
 ```bash
 sudo loginctl enable-linger $USER
 ```
+
+Essa é a diferença entre "sincroniza quando eu uso o computador" e "sincroniza
+sempre que ele estiver ligado". Para um computador pessoal, o padrão costuma
+bastar; para uma máquina que fica ligada servindo de ponto central, use o
+`enable-linger`.
 
 ---
 
@@ -480,6 +505,15 @@ watchflow doctor        # o ambiente está sadio?
 watchflow status        # a pasta está HEALTHY, PAUSED ou parada?
 watchflow jobs          # tem trabalho preso na fila?
 watchflow logs --level warn -n 50
+```
+
+Antes de concluir que algo está errado, confira a expectativa de tempo: uma
+alteração **sua** leva ~15s para virar commit, e uma alteração vinda de **outra
+máquina** pode levar até 5 minutos para aparecer (ou ~3s se o daemon acabou de
+subir). Para não esperar:
+
+```bash
+watchflow sync
 ```
 
 Os estados possíveis de uma pasta:
