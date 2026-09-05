@@ -60,6 +60,49 @@ type SyncResponse struct {
 	Message      string   `json:"message"`
 }
 
+// ListRequest parâmetros de consulta paginada para 'jobs' e 'runs'.
+type ListRequest struct {
+	WatcherName string `json:"watcher_name,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+}
+
+// JobsResponse devolve o estado da fila persistente.
+type JobsResponse struct {
+	Jobs []JobDTO `json:"jobs"`
+}
+
+// JobDTO representa uma entrada da fila SQLite para exibição.
+type JobDTO struct {
+	ID           string `json:"id"`
+	WatcherID    string `json:"watcher_id"`
+	PipelineName string `json:"pipeline_name"`
+	Status       string `json:"status"`
+	Files        int    `json:"files"`
+	RetryCount   int    `json:"retry_count"`
+	MaxRetries   int    `json:"max_retries"`
+	ScheduledFor string `json:"scheduled_for,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
+}
+
+// RunsResponse devolve o histórico de auditoria de execuções.
+type RunsResponse struct {
+	Runs []RunDTO `json:"runs"`
+}
+
+// RunDTO representa uma execução registrada em pipeline_runs.
+type RunDTO struct {
+	ID           string `json:"id"`
+	JobID        string `json:"job_id,omitempty"`
+	WatcherID    string `json:"watcher_id"`
+	PipelineName string `json:"pipeline_name"`
+	Status       string `json:"status"`
+	DurationMs   int64  `json:"duration_ms"`
+	ErrorStep    string `json:"error_step,omitempty"`
+	ErrorDetails string `json:"error_details,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
 // ActionRequest parâmetros para comandos como pause e resume.
 type ActionRequest struct {
 	WatcherName string `json:"watcher_name,omitempty"`

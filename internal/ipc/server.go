@@ -6,16 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/watchflow/watchflow/internal/logger"
 )
 
 // Handler define as operações que o daemon deve prover para responder às requisições IPC.
 type Handler interface {
 	Status(ctx context.Context) (*StatusResponse, error)
+	Jobs(ctx context.Context, watcherName string, limit int) (*JobsResponse, error)
+	Runs(ctx context.Context, watcherName string, limit int) (*RunsResponse, error)
 	Sync(ctx context.Context, watcherName string) (*SyncResponse, error)
 	Pause(ctx context.Context, watcherName string) (*ActionResponse, error)
 	Resume(ctx context.Context, watcherName string) (*ActionResponse, error)
@@ -27,6 +32,9 @@ type Server struct {
 	socketPath string
 	handler    Handler
 	listener   net.Listener
+	log        *slog.Logger
+	ready      chan struct{}
+	readyOnce  sync.Once
 	mu         sync.Mutex
 	closed     bool
 	wg         sync.WaitGroup
@@ -37,6 +45,8 @@ func NewServer(socketPath string, handler Handler) *Server {
 	return &Server{
 		socketPath: socketPath,
 		handler:    handler,
+		log:        logger.For("ipc"),
+		ready:      make(chan struct{}),
 	}
 }
 
@@ -60,6 +70,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return fmt.Errorf("outra instância do daemon já está em execução no socket '%s'", cleanPath)
 		}
 		// Socket órfão de crash anterior: remoção limpa
+		s.log.Warn("socket órfão de execução anterior removido", slog.String("socket", cleanPath))
 		_ = os.Remove(cleanPath)
 	}
 
@@ -76,6 +87,9 @@ func (s *Server) Start(ctx context.Context) error {
 	s.closed = false
 	s.mu.Unlock()
 
+	s.log.Info("servidor IPC escutando", slog.String("socket", cleanPath))
+	s.readyOnce.Do(func() { close(s.ready) })
+
 	// Encerramento limpo quando o contexto for cancelado
 	go func() {
 		<-ctx.Done()
@@ -91,16 +105,34 @@ func (s *Server) Start(ctx context.Context) error {
 			if isClosed {
 				return nil
 			}
+			s.log.Error("falha ao aceitar conexão no socket", slog.Any("error", acceptErr))
 			return acceptErr
 		}
 
+		// O registro no WaitGroup precisa ser serializado com Close(): um Add
+		// concorrente com o Wait() de Close é uso indevido de sync.WaitGroup.
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
 		s.wg.Add(1)
+		s.mu.Unlock()
+
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer func() { _ = c.Close() }()
 			s.handleConnection(ctx, c)
 		}(conn)
 	}
+}
+
+// Ready fecha assim que o socket está vinculado e aceitando conexões. Permite ao
+// chamador confirmar a trava de processo único de forma determinística, em vez
+// de presumir sucesso após uma espera arbitrária.
+func (s *Server) Ready() <-chan struct{} {
+	return s.ready
 }
 
 // Close encerra a escuta do servidor e remove o arquivo de socket do filesystem.
@@ -132,6 +164,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, io.EOF) {
 				return
 			}
+			s.log.Warn("requisição JSON-RPC malformada", slog.Any("error", err))
 			_ = enc.Encode(Response{
 				JSONRPC: "2.0",
 				Error: &RPCError{
@@ -150,6 +183,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) dispatch(ctx context.Context, req Request) Response {
+	s.log.Debug("requisição IPC recebida", slog.String("metodo", req.Method))
+
 	resp := Response{
 		JSONRPC: "2.0",
 		ID:      req.ID,
@@ -163,6 +198,32 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	switch req.Method {
 	case "status":
 		res, err := s.handler.Status(ctx)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			return resp
+		}
+		data, _ := json.Marshal(res)
+		resp.Result = data
+
+	case "jobs":
+		var p ListRequest
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &p)
+		}
+		res, err := s.handler.Jobs(ctx, p.WatcherName, p.Limit)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			return resp
+		}
+		data, _ := json.Marshal(res)
+		resp.Result = data
+
+	case "runs":
+		var p ListRequest
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &p)
+		}
+		res, err := s.handler.Runs(ctx, p.WatcherName, p.Limit)
 		if err != nil {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
 			return resp

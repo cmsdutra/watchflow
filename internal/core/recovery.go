@@ -3,12 +3,14 @@ package core
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 
 	"github.com/watchflow/watchflow/internal/config"
 	"github.com/watchflow/watchflow/internal/locking"
+	"github.com/watchflow/watchflow/internal/logger"
 )
 
 // QueueStore define os métodos necessários da fila para o procedimento de recuperação.
@@ -27,6 +29,8 @@ type RecoveryReport struct {
 // Recupera jobs órfãos que estavam em processamento (RUNNING) durante uma queda de energia ou SIGKILL,
 // e limpa estados intermediários de merge pendente nos repositórios monitorados.
 func RunStartupRecovery(ctx context.Context, store QueueStore, watchers []config.WatcherConfig) (*RecoveryReport, error) {
+	log := logger.For("recovery")
+
 	report := &RecoveryReport{
 		ReposCleaned: make([]string, 0),
 		Warnings:     make([]string, 0),
@@ -39,6 +43,10 @@ func RunStartupRecovery(ctx context.Context, store QueueStore, watchers []config
 			return nil, fmt.Errorf("falha ao resetar jobs em RUNNING durante startup: %w", err)
 		}
 		report.JobsReset = resetCount
+		if resetCount > 0 {
+			log.Warn("jobs órfãos recuperados de execução anterior interrompida",
+				slog.Int64("quantidade", resetCount))
+		}
 	}
 
 	// 2. Inspeciona a integridade das árvores Git de cada watcher configurado
@@ -79,6 +87,8 @@ func RunStartupRecovery(ctx context.Context, store QueueStore, watchers []config
 		unlock()
 
 		if cleaned {
+			log.Warn("estado de merge pendente encontrado e abortado no startup",
+				slog.String("watcher", w.Name), slog.String("repo", cleanPath))
 			report.ReposCleaned = append(report.ReposCleaned, cleanPath)
 		}
 		if warn != "" {

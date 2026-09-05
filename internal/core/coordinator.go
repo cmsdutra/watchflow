@@ -3,21 +3,39 @@ package core
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/watchflow/watchflow/internal/config"
 	"github.com/watchflow/watchflow/internal/debouncer"
 	"github.com/watchflow/watchflow/internal/ipc"
+	"github.com/watchflow/watchflow/internal/logger"
 	"github.com/watchflow/watchflow/internal/normalizer"
+	"github.com/watchflow/watchflow/internal/notify"
 	"github.com/watchflow/watchflow/internal/pipeline"
 	"github.com/watchflow/watchflow/internal/providers"
 	// Registra os provedores de ações Git no catálogo global providers.DefaultRegistry via init()
 	_ "github.com/watchflow/watchflow/internal/providers/git"
 	"github.com/watchflow/watchflow/internal/queue"
 	"github.com/watchflow/watchflow/internal/watcher"
+)
+
+const (
+	// pausedHoldDelay é o intervalo de reavaliação de um job cujo watcher está
+	// pausado pelo usuário.
+	pausedHoldDelay = 5 * time.Second
+	// conflictHoldDelay espaça a reavaliação de jobs retidos por conflito, que
+	// só destravam com ação humana.
+	conflictHoldDelay = 30 * time.Second
+	// ipcBindTimeout limita a espera pela vinculação do socket de controle.
+	ipcBindTimeout = 5 * time.Second
+	// maintenanceInterval é a cadência da rotina de manutenção (retenção do
+	// banco e coleta do supressor de eco).
+	maintenanceInterval = 1 * time.Hour
 )
 
 // Coordinator é o orquestrador central do daemon, unificando watchers, normalizers,
@@ -32,10 +50,14 @@ type Coordinator struct {
 	filters    map[string]*normalizer.Filter
 	startTime  time.Time
 	cancel     context.CancelFunc
+	cancelExec context.CancelFunc
 	workerWg   sync.WaitGroup
+	drainWg    sync.WaitGroup
 	mu         sync.RWMutex
 	paused     map[string]bool
 	version    string
+	log        *slog.Logger
+	notifier   notify.Notifier
 }
 
 // NewCoordinator instancia o coordenador central, configurando o banco SQLite e preparando o estado.
@@ -43,6 +65,8 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 	if cfg == nil {
 		return nil, fmt.Errorf("configuração não pode ser nula")
 	}
+
+	log := logger.For("coordinator")
 
 	stateDir := config.ExpandPath(cfg.Daemon.StateDir)
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
@@ -61,16 +85,31 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 		if targetPath == "" {
 			targetPath = config.ExpandPath(w.Path)
 		}
-		_ = store.RegisterWatcher(&queue.WatcherRecord{
+		if err := store.RegisterWatcher(&queue.WatcherRecord{
 			ID:     w.Name,
 			Name:   w.Name,
 			Path:   targetPath,
 			Status: queue.WatcherHealthy,
-		})
+		}); err != nil {
+			log.Error("falha ao registrar watcher no banco de estado",
+				slog.String("watcher", w.Name), slog.String("path", targetPath), slog.Any("error", err))
+		}
 	}
 
 	// Executa recuperação pós-crash antes de iniciar captura
-	_, _ = RunStartupRecovery(context.Background(), store, cfg.Watchers)
+	report, err := RunStartupRecovery(context.Background(), store, cfg.Watchers)
+	switch {
+	case err != nil:
+		log.Error("recuperação de startup falhou", slog.Any("error", err))
+	case report != nil:
+		log.Info("recuperação de startup concluída",
+			slog.Int64("jobs_reenfileirados", report.JobsReset),
+			slog.Int("repos_limpos", len(report.ReposCleaned)),
+			slog.Int("avisos", len(report.Warnings)))
+		for _, w := range report.Warnings {
+			log.Warn("aviso da recuperação de startup", slog.String("detalhe", w))
+		}
+	}
 
 	runner := pipeline.NewRunner(store, providers.DefaultRegistry, cfg)
 
@@ -83,6 +122,8 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 		filters:    make(map[string]*normalizer.Filter),
 		paused:     make(map[string]bool),
 		version:    appVersion,
+		log:        log,
+		notifier:   notify.New(cfg.Notifications.NotifyOptions()),
 	}
 
 	sockPath := config.ExpandPath(cfg.Daemon.SocketPath)
@@ -98,24 +139,43 @@ func (c *Coordinator) Store() *queue.Store {
 
 // Start inicia o pipeline reativo, os workers e o servidor IPC.
 func (c *Coordinator) Start(ctx context.Context) error {
+	// Dois context.Context distintos e independentes:
+	//   coordCtx  — captura de eventos (watchers, filtros, debouncers, IPC).
+	//   execCtx   — execução de jobs já em voo (comandos git).
+	// No shutdown a captura é cortada imediatamente, mas os jobs em andamento
+	// recebem o prazo do shutdown para concluir. Cancelar um único contexto
+	// enviaria SIGKILL a um 'git push' em curso, deixando o job em RUNNING.
 	coordCtx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
+
+	execCtx, cancelExec := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancelExec = cancelExec
+
 	c.startTime = time.Now()
 
 	// 1. Inicia o servidor IPC em segundo plano com detecção rápida de erro
 	ipcErrCh := make(chan error, 1)
 	go func() {
 		if err := c.ipcServer.Start(coordCtx); err != nil {
+			c.log.Error("servidor IPC encerrou com erro", slog.Any("error", err))
 			ipcErrCh <- err
 		}
 	}()
 
-	// Verifica se o IPC conseguiu vincular o socket (ex.: trava de processo único)
+	// Confirma a trava de processo único aguardando o socket ficar de fato
+	// vinculado. A espera fixa anterior podia expirar antes do bind sob carga de
+	// I/O e o daemon seguia adiante achando que havia vencido a trava.
 	select {
 	case err := <-ipcErrCh:
 		cancel()
 		return fmt.Errorf("falha ao iniciar servidor IPC: %w", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-c.ipcServer.Ready():
+	case <-time.After(ipcBindTimeout):
+		cancel()
+		return fmt.Errorf("tempo esgotado (%s) aguardando o servidor IPC vincular o socket", ipcBindTimeout)
+	case <-coordCtx.Done():
+		cancel()
+		return coordCtx.Err()
 	}
 
 	// 2. Inicia os workers que consom jobs da fila persistente
@@ -124,10 +184,12 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		workersCount = 2
 	}
 
+	c.log.Info("iniciando workers de pipeline", slog.Int("quantidade", workersCount))
+
 	for i := 1; i <= workersCount; i++ {
 		workerID := fmt.Sprintf("worker-%d", i)
 		c.workerWg.Add(1)
-		go c.workerLoop(coordCtx, workerID)
+		go c.workerLoop(coordCtx, execCtx, workerID)
 	}
 
 	// 3. Inicializa e conecta a cadeia reativa para cada watcher ativo
@@ -143,6 +205,8 @@ func (c *Coordinator) Start(ctx context.Context) error {
 
 		w, err := watcher.New(wCfg.Name, targetPath)
 		if err != nil {
+			c.log.Error("falha ao criar watcher",
+				slog.String("watcher", wCfg.Name), slog.String("path", targetPath), slog.Any("error", err))
 			cancel()
 			return fmt.Errorf("falha ao criar watcher para '%s' (%s): %w", wCfg.Name, targetPath, err)
 		}
@@ -170,7 +234,23 @@ func (c *Coordinator) Start(ctx context.Context) error {
 
 		w.Start(coordCtx)
 		deb.Start(coordCtx)
+
+		c.log.Info("watcher ativo",
+			slog.String("watcher", wCfg.Name),
+			slog.String("path", targetPath),
+			slog.Int("diretorios_vigiados", len(w.WatchedDirs())),
+			slog.Duration("debounce", wCfg.DebounceDuration),
+			slog.Duration("max_wait", wCfg.MaxWaitDuration))
 	}
+
+	// 4. Rotina periódica de manutenção
+	c.workerWg.Add(1)
+	go c.maintenanceLoop(coordCtx)
+
+	c.log.Info("daemon pronto",
+		slog.String("versao", c.version),
+		slog.Int("watchers", len(c.watchers)),
+		slog.Int("pid", os.Getpid()))
 
 	select {
 	case <-coordCtx.Done():
@@ -188,6 +268,33 @@ func (c *Coordinator) bindWatcherPipeline(
 	deb *debouncer.Debouncer,
 ) {
 	normEventsCh := make(chan normalizer.NormalizedEvent, 100)
+	log := c.log.With(slog.String("watcher", wCfg.Name))
+
+	// Etapa 0: Erros do kernel/fsnotify. Sem este consumidor o canal satura e
+	// perdas de evento (IN_Q_OVERFLOW, estouro de max_user_watches) passariam
+	// despercebidas, deixando o daemon cego sem qualquer sinal externo.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err, ok := <-w.Errors():
+				if !ok {
+					return
+				}
+				log.Error("erro reportado pelo watcher do kernel", slog.Any("error", err))
+
+				// Um estouro de max_user_watches ou de fila do inotify significa
+				// que eventos foram perdidos: o watcher não está mais íntegro e
+				// o usuário precisa saber disso em 'watchflow status'.
+				if updErr := c.store.UpdateWatcherStatus(wCfg.Name, queue.WatcherDegraded, err.Error()); updErr != nil {
+					log.Warn("falha ao marcar watcher como DEGRADED", slog.Any("error", updErr))
+				}
+				_ = c.notifier.Notify(ctx, notify.Failure(wCfg.Name, "watcher",
+					"o monitoramento do sistema de arquivos reportou erro; eventos podem ter sido perdidos: "+err.Error()))
+			}
+		}
+	}()
 
 	// Etapa 1: Watcher -> Normalizer
 	go filter.ProcessStream(ctx, w.Events(), normEventsCh)
@@ -202,65 +309,94 @@ func (c *Coordinator) bindWatcherPipeline(
 				if !ok {
 					return
 				}
-				_ = c.store.UpdateWatcherEventTime(wCfg.Name)
-				deb.In() <- ev
+				if err := c.store.UpdateWatcherEventTime(wCfg.Name); err != nil {
+					log.Warn("falha ao registrar horário do último evento", slog.Any("error", err))
+				}
+				// O envio também observa o cancelamento: sem isso a goroutine
+				// vazaria bloqueada caso o debouncer pare com o buffer cheio.
+				select {
+				case deb.In() <- ev:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 
 	// Etapa 3: Debouncer Batch -> SQLite Queue
+	//
+	// Encerra apenas quando o debouncer fecha o canal de saída, e não em
+	// ctx.Done(): é isso que garante que o flush final do encerramento seja
+	// persistido na fila em vez de descartado junto com a goroutine.
+	c.drainWg.Add(1)
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case batch, ok := <-deb.Out():
-				if !ok {
-					return
+		defer c.drainWg.Done()
+
+		for batch := range deb.Out() {
+			if len(batch.Files) == 0 {
+				continue
+			}
+
+			// Um watcher pausado NÃO descarta o lote: o job é persistido e
+			// aguarda na fila até o resume. Descartar aqui perderia alterações
+			// reais do usuário em silêncio.
+			log.Info("lote de alterações consolidado",
+				slog.Int("arquivos", len(batch.Files)),
+				slog.Int("eventos", batch.EventsCount),
+				slog.String("gatilho", string(batch.Trigger)))
+
+			for _, pipeName := range wCfg.Pipelines {
+				jobID := fmt.Sprintf("job_%d_%s_%s", time.Now().UnixNano(), wCfg.Name, pipeName)
+				job := &queue.Job{
+					ID:           jobID,
+					WatcherID:    wCfg.Name,
+					PipelineName: pipeName,
+					PayloadFiles: batch.Files,
+					MaxRetries:   c.retryLimitFor(pipeName),
 				}
-				if len(batch.Files) == 0 {
+
+				if err := c.store.EnqueueJob(job); err != nil {
+					// Ponto mais sensível do daemon: falhar aqui significa
+					// perder a intenção de sincronizar as alterações do lote.
+					log.Error("FALHA AO ENFILEIRAR JOB — alterações não serão sincronizadas",
+						slog.String("job_id", jobID),
+						slog.String("pipeline", pipeName),
+						slog.Int("arquivos", len(batch.Files)),
+						slog.Any("error", err))
 					continue
 				}
 
-				c.mu.RLock()
-				isPaused := c.paused[wCfg.Name]
-				c.mu.RUnlock()
-				if isPaused {
-					continue
-				}
-
-				// Para cada pipeline associado a este watcher, cria um job persistente
-				for _, pipeName := range wCfg.Pipelines {
-					jobID := fmt.Sprintf("job_%d_%s", time.Now().UnixNano(), wCfg.Name)
-					job := &queue.Job{
-						ID:           jobID,
-						WatcherID:    wCfg.Name,
-						PipelineName: pipeName,
-						PayloadFiles: batch.Files,
-						MaxRetries:   5,
-					}
-					_ = c.store.EnqueueJob(job)
-				}
+				log.Debug("job enfileirado",
+					slog.String("job_id", jobID), slog.String("pipeline", pipeName))
 			}
 		}
 	}()
 }
 
-func (c *Coordinator) workerLoop(ctx context.Context, workerID string) {
+// workerLoop consome jobs da fila persistente. stopCtx interrompe a captura de
+// novos jobs; execCtx governa a execução do job corrente e só é cancelado ao
+// final do prazo de shutdown.
+func (c *Coordinator) workerLoop(stopCtx, execCtx context.Context, workerID string) {
 	defer c.workerWg.Done()
+
+	log := c.log.With(slog.String("worker", workerID))
+	defer log.Debug("worker encerrado")
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stopCtx.Done():
 			return
 		default:
 		}
 
 		job, err := c.store.DequeueNextPending(workerID)
+		if err != nil {
+			log.Warn("falha ao alocar próximo job da fila", slog.Any("error", err))
+		}
 		if err != nil || job == nil {
 			// Nenhum job pendente no momento: dorme brevemente com backoff leve
 			select {
-			case <-ctx.Done():
+			case <-stopCtx.Done():
 				return
 			case <-time.After(300 * time.Millisecond):
 				continue
@@ -272,26 +408,164 @@ func (c *Coordinator) workerLoop(ctx context.Context, workerID string) {
 		isPaused := c.paused[job.WatcherID]
 		c.mu.RUnlock()
 		if isPaused {
-			// Devolve para pending para processar quando for despausado
-			_ = c.store.MarkJobFailed(job.ID, "watcher pausado temporariamente", true, 5*time.Second)
+			// Adiamento por decisão do usuário não é falha: reenfileira sem
+			// consumir uma tentativa, caso contrário uma pausa de poucos
+			// segundos esgotaria max_retries e mataria os jobs pendentes.
+			if err := c.store.RequeueJob(job.ID, pausedHoldDelay, "watcher pausado pelo usuário; execução adiada"); err != nil {
+				log.Error("falha ao reenfileirar job de watcher pausado",
+					slog.String("job_id", job.ID), slog.Any("error", err))
+			}
+			continue
+		}
+
+		// CONFLICT_HALTED significa parada até intervenção humana. Sem esta
+		// checagem o daemon reexecuta o pipeline indefinidamente: cada
+		// 'git merge --abort' reescreve a árvore, o inotify dispara de novo e
+		// o ciclo se realimenta, gerando um alerta por volta.
+		if c.isConflictHalted(job.WatcherID) {
+			if err := c.store.RequeueJob(job.ID, conflictHoldDelay,
+				"watcher interrompido por conflito; aguardando 'watchflow resume'"); err != nil {
+				log.Error("falha ao segurar job de watcher em conflito",
+					slog.String("job_id", job.ID), slog.Any("error", err))
+			}
+			log.Debug("job retido: watcher aguardando resolução manual de conflito",
+				slog.String("job_id", job.ID), slog.String("watcher", job.WatcherID))
 			continue
 		}
 
 		// Executa o job através do runner
-		_, _ = c.runner.ExecuteJob(ctx, job)
+		jobLog := log.With(
+			slog.String("job_id", job.ID),
+			slog.String("watcher", job.WatcherID),
+			slog.String("pipeline", job.PipelineName))
+
+		jobLog.Info("executando job",
+			slog.Int("arquivos", len(job.PayloadFiles)),
+			slog.Int("tentativa", job.RetryCount+1))
+
+		res, execErr := c.runner.ExecuteJob(execCtx, job)
+		switch {
+		case execErr != nil:
+			attrs := []any{slog.Any("error", execErr)}
+			if res != nil {
+				attrs = append(attrs,
+					slog.String("step", res.ErrorStep),
+					slog.String("categoria", res.Category.String()),
+					slog.Duration("duracao", res.Duration))
+			}
+			jobLog.Error("job falhou", attrs...)
+		case res != nil:
+			jobLog.Info("job concluído com sucesso", slog.Duration("duracao", res.Duration))
+		}
+
+		c.notifyJobOutcome(execCtx, job, res, execErr)
+	}
+}
+
+// maintenanceLoop executa periodicamente a poda do banco e a coleta de entradas
+// vencidas do supressor de eco, mantendo o consumo estável em execução contínua.
+func (c *Coordinator) maintenanceLoop(ctx context.Context) {
+	defer c.workerWg.Done()
+
+	log := c.log.With(slog.String("rotina", "manutencao"))
+	ticker := time.NewTicker(maintenanceInterval)
+	defer ticker.Stop()
+
+	run := func() {
+		if res, err := c.store.PurgeOldRecords(queue.DefaultRetention); err != nil {
+			log.Warn("falha ao purgar registros antigos", slog.Any("error", err))
+		} else if res.Jobs > 0 || res.Runs > 0 {
+			log.Info("histórico antigo removido",
+				slog.Int64("jobs", res.Jobs), slog.Int64("execucoes", res.Runs))
+		}
+
+		if n := normalizer.DefaultEchoSuppressor.PurgeExpired(); n > 0 {
+			log.Debug("entradas de supressão de eco expiradas removidas", slog.Int("quantidade", n))
+		}
+	}
+
+	run() // Primeira passagem no boot
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+// retryLimitFor resolve o número de tentativas declarado pelo pipeline.
+func (c *Coordinator) retryLimitFor(pipelineName string) int {
+	if p, ok := c.cfg.Pipelines[pipelineName]; ok {
+		return p.RetryLimit()
+	}
+	return config.DefaultMaxRetries
+}
+
+// hasWatcher informa se o nome corresponde a um watcher declarado na configuração.
+func (c *Coordinator) hasWatcher(name string) bool {
+	for _, w := range c.cfg.Watchers {
+		if w.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isConflictHalted informa se o watcher está interrompido por conflito de merge
+// e, portanto, não deve ter pipelines executados até que o usuário intervenha.
+func (c *Coordinator) isConflictHalted(watcherID string) bool {
+	rec, err := c.store.GetWatcher(watcherID)
+	if err != nil || rec == nil {
+		return false
+	}
+	return rec.Status == queue.WatcherConflictHalted
+}
+
+// notifyJobOutcome traduz o resultado de um job em alerta ao usuário.
+// Falhas transitórias que ainda serão retentadas não geram notificação: só
+// interessa avisar quando há algo que exija ação humana.
+func (c *Coordinator) notifyJobOutcome(ctx context.Context, job *queue.Job, res *pipeline.RunResult, execErr error) {
+	if res == nil {
+		return
+	}
+
+	switch {
+	case execErr == nil && res.Success:
+		_ = c.notifier.Notify(ctx, notify.Success(job.WatcherID, len(job.PayloadFiles), res.Duration))
+
+	case res.Category == pipeline.CategoryConflict:
+		detail := ""
+		if res.Error != nil {
+			detail = res.Error.Error()
+		}
+		_ = c.notifier.Notify(ctx, notify.Conflict(job.WatcherID, detail))
+
+	case !res.WillRetry:
+		detail := ""
+		if res.Error != nil {
+			detail = res.Error.Error()
+		}
+		_ = c.notifier.Notify(ctx, notify.Failure(job.WatcherID, job.PipelineName, detail))
 	}
 }
 
 // Shutdown finaliza ordenadamente o daemon liberando todos os recursos.
 func (c *Coordinator) Shutdown(ctx context.Context) error {
+	c.log.Info("iniciando encerramento gracioso")
+
 	if c.cancel != nil {
 		c.cancel()
 	}
 
 	// 1. Para todos os watchers
 	c.mu.Lock()
-	for _, w := range c.watchers {
-		_ = w.Close()
+	for name, w := range c.watchers {
+		if err := w.Close(); err != nil {
+			c.log.Warn("falha ao encerrar watcher", slog.String("watcher", name), slog.Any("error", err))
+		}
 	}
 	// 2. Para todos os debouncers
 	for _, deb := range c.debouncers {
@@ -299,29 +573,70 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	// 3. Aguarda workers em voo com timeout
-	workerDone := make(chan struct{})
-	go func() {
+	// 3. Aguarda a persistência do lote final descarregado pelos debouncers
+	if !waitGroup(ctx, &c.drainWg) {
+		c.log.Warn("prazo esgotado antes de persistir o lote final dos debouncers")
+	}
+
+	// 4. Aguarda os jobs em voo concluírem dentro do prazo de shutdown
+	workersFinished := waitGroup(ctx, &c.workerWg)
+	if !workersFinished {
+		c.log.Warn("prazo de encerramento esgotado; interrompendo jobs ainda em execução")
+	}
+
+	// 5. Prazo esgotado: só agora os comandos git em curso são interrompidos
+	if c.cancelExec != nil {
+		c.cancelExec()
+	}
+
+	if !workersFinished {
 		c.workerWg.Wait()
-		close(workerDone)
+	}
+
+	// 6. Jobs interrompidos por ordem de parada não são falha: voltam para
+	// PENDING sem consumir retry, para serem retomados no próximo boot.
+	if c.store != nil {
+		requeued, err := c.store.RequeueRunningJobs("daemon encerrado graciosamente; job reenfileirado sem penalidade")
+		if err != nil {
+			c.log.Error("falha ao reenfileirar jobs interrompidos", slog.Any("error", err))
+		} else if requeued > 0 {
+			c.log.Info("jobs interrompidos devolvidos à fila sem penalidade", slog.Int64("quantidade", requeued))
+		}
+	}
+
+	// 7. Encerra servidor IPC
+	if c.ipcServer != nil {
+		if err := c.ipcServer.Close(); err != nil {
+			c.log.Warn("falha ao encerrar servidor IPC", slog.Any("error", err))
+		}
+	}
+
+	// 8. Encerra o SQLite store
+	if c.store != nil {
+		if err := c.store.Close(); err != nil {
+			c.log.Warn("falha ao fechar banco de estado", slog.Any("error", err))
+		}
+	}
+
+	c.log.Info("encerramento concluído")
+	return nil
+}
+
+// waitGroup aguarda o WaitGroup respeitando o prazo do contexto.
+// Retorna true se o grupo concluiu dentro do prazo.
+func waitGroup(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
 	}()
 
 	select {
-	case <-workerDone:
+	case <-done:
+		return true
 	case <-ctx.Done():
+		return false
 	}
-
-	// 4. Encerra servidor IPC
-	if c.ipcServer != nil {
-		_ = c.ipcServer.Close()
-	}
-
-	// 5. Encerra o SQLite store
-	if c.store != nil {
-		_ = c.store.Close()
-	}
-
-	return nil
 }
 
 // Status responde à solicitação do comando 'watchflow status'.
@@ -334,24 +649,23 @@ func (c *Coordinator) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 		return nil, err
 	}
 
-	pendingJobs, _ := c.store.ListPendingJobs("")
-	runningCount := 0
-	blockedCount := 0
+	// Antes estes contadores eram constantes zero: 'watchflow status' sempre
+	// reportava nenhum job em execução ou bloqueado, mesmo com um conflito ativo.
+	counts, err := c.store.CountJobsByStatus()
+	if err != nil {
+		c.log.Warn("falha ao contar jobs por status", slog.Any("error", err))
+		counts = map[queue.JobStatus]int{}
+	}
+
+	pendingCount := counts[queue.StatusPending]
+	runningCount := counts[queue.StatusRunning]
+	blockedCount := counts[queue.StatusBlocked]
 
 	var dtos []ipc.WatcherStatusDTO
 	for _, w := range watchers {
-		lastEv := ""
-		if w.LastEventAt != nil {
-			lastEv = w.LastEventAt.Format("2006-01-02 15:04:05")
-		}
-		lastSuccess := ""
-		if w.LastSuccessSyncAt != nil {
-			lastSuccess = w.LastSuccessSyncAt.Format("2006-01-02 15:04:05")
-		}
-		lastFailed := ""
-		if w.LastFailedSyncAt != nil {
-			lastFailed = w.LastFailedSyncAt.Format("2006-01-02 15:04:05")
-		}
+		lastEv := formatTimePtr(w.LastEventAt)
+		lastSuccess := formatTimePtr(w.LastSuccessSyncAt)
+		lastFailed := formatTimePtr(w.LastFailedSyncAt)
 
 		statusStr := string(w.Status)
 		if c.paused[w.Name] {
@@ -385,10 +699,96 @@ func (c *Coordinator) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 		Uptime:      uptimeStr,
 		Version:     versionStr,
 		Watchers:    dtos,
-		PendingJobs: len(pendingJobs),
+		PendingJobs: pendingCount,
 		RunningJobs: runningCount,
 		BlockedJobs: blockedCount,
 	}, nil
+}
+
+// Jobs responde à consulta do estado da fila persistente (CLI 'jobs' e TUI).
+func (c *Coordinator) Jobs(_ context.Context, watcherName string, limit int) (*ipc.JobsResponse, error) {
+	if watcherName != "" && !c.hasWatcher(watcherName) {
+		return nil, fmt.Errorf("watcher '%s' não existe na configuração", watcherName)
+	}
+
+	jobs, err := c.store.ListRecentJobs(watcherName, limit)
+	if err != nil {
+		c.log.Warn("falha ao listar jobs", slog.Any("error", err))
+		return nil, err
+	}
+
+	dtos := make([]ipc.JobDTO, 0, len(jobs))
+	for _, j := range jobs {
+		dto := ipc.JobDTO{
+			ID:           j.ID,
+			WatcherID:    j.WatcherID,
+			PipelineName: j.PipelineName,
+			Status:       string(j.Status),
+			Files:        len(j.PayloadFiles),
+			RetryCount:   j.RetryCount,
+			MaxRetries:   j.MaxRetries,
+			LastError:    j.LastError,
+			UpdatedAt:    formatTime(j.UpdatedAt),
+		}
+		// Só faz sentido exibir o agendamento de um job que ainda vai rodar.
+		if j.Status == queue.StatusPending {
+			dto.ScheduledFor = formatTime(j.ScheduledFor)
+		}
+		dtos = append(dtos, dto)
+	}
+
+	return &ipc.JobsResponse{Jobs: dtos}, nil
+}
+
+// Runs responde à consulta do histórico de auditoria de execuções.
+func (c *Coordinator) Runs(_ context.Context, watcherName string, limit int) (*ipc.RunsResponse, error) {
+	if watcherName != "" && !c.hasWatcher(watcherName) {
+		return nil, fmt.Errorf("watcher '%s' não existe na configuração", watcherName)
+	}
+
+	runs, err := c.store.ListRecentRuns(watcherName, limit)
+	if err != nil {
+		c.log.Warn("falha ao listar execuções", slog.Any("error", err))
+		return nil, err
+	}
+
+	dtos := make([]ipc.RunDTO, 0, len(runs))
+	for _, r := range runs {
+		dtos = append(dtos, ipc.RunDTO{
+			ID:           r.ID,
+			JobID:        r.JobID,
+			WatcherID:    r.WatcherID,
+			PipelineName: r.PipelineName,
+			Status:       r.Status,
+			DurationMs:   r.DurationMs,
+			ErrorStep:    r.ErrorStep,
+			ErrorDetails: r.ErrorDetails,
+			CreatedAt:    formatTime(r.CreatedAt),
+		})
+	}
+
+	return &ipc.RunsResponse{Runs: dtos}, nil
+}
+
+// formatTime normaliza timestamps para exibição, devolvendo vazio quando nulos.
+//
+// O SQLite grava CURRENT_TIMESTAMP em UTC e o driver devolve o valor marcado
+// como UTC. Formatar sem converter mostraria ao usuário um horário deslocado
+// pelo fuso — em UTC-3, uma sincronização das 23h aparecia como 02h do dia
+// seguinte. O instante sempre esteve correto; apenas a exibição não.
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format("2006-01-02 15:04:05")
+}
+
+// formatTimePtr é a variante para colunas anuláveis.
+func formatTimePtr(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return formatTime(*t)
 }
 
 // Sync responde à solicitação do comando 'watchflow sync'.
@@ -396,9 +796,24 @@ func (c *Coordinator) Sync(ctx context.Context, watcherName string) (*ipc.SyncRe
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var enqueued []string
+	if watcherName != "" && !c.hasWatcher(watcherName) {
+		return nil, fmt.Errorf("watcher '%s' não existe na configuração", watcherName)
+	}
+
+	var (
+		enqueued []string
+		skipped  []string
+	)
+
 	for _, wCfg := range c.cfg.Watchers {
 		if watcherName != "" && wCfg.Name != watcherName {
+			continue
+		}
+
+		// Enfileirar para um watcher desabilitado produziria jobs que nenhum
+		// watcher está monitorando e que ninguém pediu.
+		if !wCfg.IsEnabled() {
+			skipped = append(skipped, wCfg.Name)
 			continue
 		}
 
@@ -409,17 +824,31 @@ func (c *Coordinator) Sync(ctx context.Context, watcherName string) (*ipc.SyncRe
 				WatcherID:    wCfg.Name,
 				PipelineName: pipeName,
 				PayloadFiles: []string{},
-				MaxRetries:   5,
+				MaxRetries:   c.retryLimitFor(pipeName),
 			}
-			if err := c.store.EnqueueJob(job); err == nil {
-				enqueued = append(enqueued, jobID)
+			if err := c.store.EnqueueJob(job); err != nil {
+				c.log.Error("falha ao enfileirar job de sincronização manual",
+					slog.String("job_id", jobID), slog.String("watcher", wCfg.Name), slog.Any("error", err))
+				continue
 			}
+			enqueued = append(enqueued, jobID)
 		}
+	}
+
+	c.log.Info("sincronização manual solicitada",
+		slog.String("watcher_filtro", watcherName),
+		slog.Int("jobs", len(enqueued)),
+		slog.Int("ignorados", len(skipped)))
+
+	message := fmt.Sprintf("sincronização forçada solicitada (%d jobs gerados)", len(enqueued))
+	if len(skipped) > 0 {
+		message += fmt.Sprintf("; %d watcher(s) desabilitado(s) ignorado(s): %s",
+			len(skipped), strings.Join(skipped, ", "))
 	}
 
 	return &ipc.SyncResponse{
 		EnqueuedJobs: enqueued,
-		Message:      fmt.Sprintf("sincronização forçada solicitada (%d jobs gerados)", len(enqueued)),
+		Message:      message,
 	}, nil
 }
 
@@ -430,7 +859,10 @@ func (c *Coordinator) Pause(ctx context.Context, watcherName string) (*ipc.Actio
 
 	if watcherName != "" {
 		c.paused[watcherName] = true
-		_ = c.store.UpdateWatcherStatus(watcherName, queue.WatcherPaused, "")
+		if err := c.store.UpdateWatcherStatus(watcherName, queue.WatcherPaused, ""); err != nil {
+			c.log.Warn("falha ao persistir status PAUSED", slog.String("watcher", watcherName), slog.Any("error", err))
+		}
+		c.log.Info("watcher pausado", slog.String("watcher", watcherName))
 		return &ipc.ActionResponse{
 			Success: true,
 			Message: fmt.Sprintf("watcher '%s' pausado com sucesso", watcherName),
@@ -439,8 +871,11 @@ func (c *Coordinator) Pause(ctx context.Context, watcherName string) (*ipc.Actio
 
 	for _, w := range c.cfg.Watchers {
 		c.paused[w.Name] = true
-		_ = c.store.UpdateWatcherStatus(w.Name, queue.WatcherPaused, "")
+		if err := c.store.UpdateWatcherStatus(w.Name, queue.WatcherPaused, ""); err != nil {
+			c.log.Warn("falha ao persistir status PAUSED", slog.String("watcher", w.Name), slog.Any("error", err))
+		}
 	}
+	c.log.Info("todos os watchers pausados", slog.Int("quantidade", len(c.cfg.Watchers)))
 
 	return &ipc.ActionResponse{
 		Success: true,
@@ -455,7 +890,15 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 
 	if watcherName != "" {
 		delete(c.paused, watcherName)
-		_ = c.store.UpdateWatcherStatus(watcherName, queue.WatcherHealthy, "")
+		// Também limpa CONFLICT_HALTED: 'resume' é a confirmação do usuário de
+		// que o conflito foi resolvido manualmente.
+		if err := c.store.UpdateWatcherStatus(watcherName, queue.WatcherHealthy, ""); err != nil {
+			c.log.Warn("falha ao persistir status HEALTHY", slog.String("watcher", watcherName), slog.Any("error", err))
+		}
+		if r, ok := c.notifier.(notify.Resetter); ok {
+			r.Reset(watcherName)
+		}
+		c.log.Info("watcher retomado", slog.String("watcher", watcherName))
 		return &ipc.ActionResponse{
 			Success: true,
 			Message: fmt.Sprintf("watcher '%s' retomado com sucesso", watcherName),
@@ -464,8 +907,16 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 
 	for _, w := range c.cfg.Watchers {
 		delete(c.paused, w.Name)
-		_ = c.store.UpdateWatcherStatus(w.Name, queue.WatcherHealthy, "")
+		if err := c.store.UpdateWatcherStatus(w.Name, queue.WatcherHealthy, ""); err != nil {
+			c.log.Warn("falha ao persistir status HEALTHY", slog.String("watcher", w.Name), slog.Any("error", err))
+		}
 	}
+	if r, ok := c.notifier.(notify.Resetter); ok {
+		for _, w := range c.cfg.Watchers {
+			r.Reset(w.Name)
+		}
+	}
+	c.log.Info("todos os watchers retomados", slog.Int("quantidade", len(c.cfg.Watchers)))
 
 	return &ipc.ActionResponse{
 		Success: true,
@@ -475,6 +926,8 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 
 // Stop responde à solicitação do comando 'watchflow stop'.
 func (c *Coordinator) Stop(ctx context.Context) (*ipc.ActionResponse, error) {
+	c.log.Info("encerramento solicitado via IPC")
+
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		if c.cancel != nil {

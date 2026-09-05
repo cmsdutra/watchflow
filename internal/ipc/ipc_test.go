@@ -34,6 +34,20 @@ func (m *mockHandler) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 	}, nil
 }
 
+func (m *mockHandler) Jobs(_ context.Context, watcherName string, limit int) (*ipc.JobsResponse, error) {
+	return &ipc.JobsResponse{Jobs: []ipc.JobDTO{{
+		ID: "job_1", WatcherID: "vault", PipelineName: "sync", Status: "PENDING",
+		Files: 3, RetryCount: 1, MaxRetries: 5,
+	}}}, nil
+}
+
+func (m *mockHandler) Runs(_ context.Context, watcherName string, limit int) (*ipc.RunsResponse, error) {
+	return &ipc.RunsResponse{Runs: []ipc.RunDTO{{
+		ID: "run_1", JobID: "job_1", WatcherID: "vault", PipelineName: "sync",
+		Status: "SUCCESS", DurationMs: 120, CreatedAt: "2026-09-04 10:00:00",
+	}}}, nil
+}
+
 func (m *mockHandler) Sync(ctx context.Context, watcherName string) (*ipc.SyncResponse, error) {
 	if m.syncFunc != nil {
 		return m.syncFunc(ctx, watcherName)
@@ -174,4 +188,65 @@ func TestIPC_ProcessLockConflict(t *testing.T) {
 	}
 
 	_ = srv1.Close()
+}
+
+// TestIPC_JobsAndRunsRoundTrip garante que os métodos novos atravessam o
+// protocolo JSON-RPC preservando os campos que a TUI vai consumir.
+func TestIPC_JobsAndRunsRoundTrip(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "wf.sock")
+	handler := &mockHandler{}
+
+	srv := ipc.NewServer(sockPath, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = srv.Close()
+	}()
+
+	go func() { _ = srv.Start(ctx) }()
+	<-srv.Ready()
+
+	client := ipc.NewClient(sockPath)
+
+	jobs, err := client.Jobs(context.Background(), "vault", 10)
+	if err != nil {
+		t.Fatalf("chamada 'jobs' falhou: %v", err)
+	}
+	if len(jobs.Jobs) != 1 {
+		t.Fatalf("esperava 1 job, obteve %d", len(jobs.Jobs))
+	}
+	if jobs.Jobs[0].Files != 3 || jobs.Jobs[0].RetryCount != 1 || jobs.Jobs[0].MaxRetries != 5 {
+		t.Errorf("campos do job não sobreviveram ao round-trip: %+v", jobs.Jobs[0])
+	}
+
+	runs, err := client.Runs(context.Background(), "", 10)
+	if err != nil {
+		t.Fatalf("chamada 'runs' falhou: %v", err)
+	}
+	if len(runs.Runs) != 1 {
+		t.Fatalf("esperava 1 execução, obteve %d", len(runs.Runs))
+	}
+	if runs.Runs[0].DurationMs != 120 || runs.Runs[0].JobID != "job_1" {
+		t.Errorf("campos da execução não sobreviveram ao round-trip: %+v", runs.Runs[0])
+	}
+}
+
+func TestIPC_UnknownMethodStillRejected(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "wf.sock")
+
+	srv := ipc.NewServer(sockPath, &mockHandler{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = srv.Close()
+	}()
+
+	go func() { _ = srv.Start(ctx) }()
+	<-srv.Ready()
+
+	client := ipc.NewClient(sockPath)
+	var out map[string]any
+	if err := client.Call(context.Background(), "metodo_inexistente", nil, &out); err == nil {
+		t.Error("esperava erro para método desconhecido")
+	}
 }

@@ -100,6 +100,24 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	return &resp, nil
 }
 
+// Jobs consulta o estado da fila persistente do daemon.
+func (c *Client) Jobs(ctx context.Context, watcherName string, limit int) (*JobsResponse, error) {
+	var res JobsResponse
+	if err := c.Call(ctx, "jobs", ListRequest{WatcherName: watcherName, Limit: limit}, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// Runs consulta o histórico de auditoria de execuções de pipeline.
+func (c *Client) Runs(ctx context.Context, watcherName string, limit int) (*RunsResponse, error) {
+	var res RunsResponse
+	if err := c.Call(ctx, "runs", ListRequest{WatcherName: watcherName, Limit: limit}, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Sync solicita a sincronização imediata de um watcher ou de todos se watcherName for vazio.
 func (c *Client) Sync(ctx context.Context, watcherName string) (*SyncResponse, error) {
 	var resp SyncResponse
