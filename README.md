@@ -149,7 +149,7 @@ mesmo. Em repouso consome poucos megabytes de memória.
 ```bash
 git clone https://github.com/cmsdutra/watchflow.git
 cd watchflow
-./scripts/install.sh
+./install.sh
 ```
 
 O script compila o binário, instala em `~/.local/bin`, cria a configuração
@@ -173,6 +173,9 @@ Opções:
 | `--no-service` | Não registra a unit do systemd |
 | `--no-build` | Usa o binário já existente em `bin/` |
 | `--yes` | Não faz perguntas |
+
+(`./install.sh` na raiz é um atalho para `scripts/install.sh`; os dois são o
+mesmo script.)
 
 O `--prefix` que você usar fica registrado no desinstalador, então não precisa
 repeti-lo na hora de remover.

@@ -24,7 +24,10 @@ INSTALL_SERVICE=1
 DO_BUILD=1
 ASSUME_YES=0
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# readlink -f resolve o symlink de conveniência da raiz do projeto. Sem isso,
+# invocar './install.sh' faria REPO_ROOT apontar para o diretório PAI do
+# repositório, e o script procuraria go.mod, configs/ e deploy/ no lugar errado.
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BINARY_NAME="watchflow"
 
 # ---------------------------------------------------------------------------
