@@ -51,6 +51,21 @@ linters-settings:
       - supress
       - respondendo
       - momento
+      - eles
+      - dsn
+      - contextos
+      - informativo
+      - alteracao
+      - entrega
+      - calcular
+      - devolvendo
+      - prestes
+      - convers
+      - independente
+      - presentesão
+      - convers
+      - independente
+      - presentes
 
 issues:
   exclude-use-default: false
