@@ -364,14 +364,18 @@ func (c *Coordinator) pullLoop(ctx context.Context, wCfg config.WatcherConfig) {
 			}
 			log.Debug("consulta periódica ao remoto enfileirada", slog.String("job_id", jobID))
 		}
-
-		c.markEnqueued(wCfg.Name)
 	}
 }
 
 // shouldSkipPull evita trabalho inútil: um watcher pausado ou interrompido por
 // conflito não deve acumular jobs, e uma sincronização recente já trouxe o que
 // havia no remoto.
+//
+// A janela olha apenas para sincronizações disparadas por ALTERAÇÃO LOCAL. O
+// laço de pull não carimba lastEnqueue: se carimbasse, cada consulta suprimiria
+// a seguinte — o ticker tem o mesmo período da janela, então o tick seguinte
+// encontraria time.Since() alguns microssegundos abaixo do limite e se pularia,
+// fazendo a cadência real virar o dobro do pull_interval configurado.
 func (c *Coordinator) shouldSkipPull(wCfg config.WatcherConfig) (bool, string) {
 	c.mu.RLock()
 	isPaused := c.paused[wCfg.Name]
