@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	// Import do driver pure-Go sqlite para registro no database/sql
@@ -79,24 +80,41 @@ func NewSQLiteStore(dbPath string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Todas as configurações vão no DSN, e não via db.Exec("PRAGMA ..."):
+	// database/sql mantém um POOL de conexões, e um PRAGMA executado por Exec
+	// atinge apenas a conexão que atendeu aquela chamada. As demais nasciam sem
+	// busy_timeout, então a contenção entre workers virava "database is locked"
+	// imediato em vez de aguardar a trava.
+	//
+	// _txlock=immediate faz BEGIN IMMEDIATE: a transação já nasce com a trava de
+	// escrita. Com o padrão (deferred), dois workers selecionavam a MESMA linha
+	// e o segundo levava SQLITE_BUSY_SNAPSHOT ao promover para escrita.
+	params := strings.Join([]string{
+		"_txlock=immediate",
+		"_pragma=busy_timeout(5000)",
+		"_pragma=journal_mode(WAL)",
+		"_pragma=synchronous(NORMAL)",
+		"_pragma=foreign_keys(ON)",
+	}, "&")
+
+	dsn := "file:" + dbPath + "?" + params
+	if dbPath == ":memory:" {
+		dsn = "file::memory:?cache=shared&" + params
+	}
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("falha ao abrir banco de dados SQLite '%s': %w", dbPath, err)
 	}
 
-	// Pragmas para garantir integridade, concorrência e WAL mode
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA foreign_keys=ON;",
-	}
+	// O SQLite admite um único escritor por vez; um pool grande apenas multiplica
+	// a contenção sem ganho de vazão.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("falha ao aplicar pragma '%s': %w", p, err)
-		}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("falha ao conectar ao banco '%s': %w", dbPath, err)
 	}
 
 	if _, err := db.Exec(schemaSQL); err != nil {
@@ -366,6 +384,40 @@ func (s *Store) MarkJobFailed(jobID string, lastError string, canRetry bool, bac
 	return nil
 }
 
+// RequeueJob devolve um job para PENDING sem consumir uma tentativa de retry.
+// Usado quando a execução foi adiada por uma condição externa ao job em si
+// (ex.: watcher pausado pelo usuário), que não representa uma falha real.
+func (s *Store) RequeueJob(jobID string, delay time.Duration, reason string) error {
+	query := `
+	UPDATE jobs
+	SET status = 'PENDING', scheduled_for = ?, locked_by = NULL, locked_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP
+	WHERE id = ?;
+	`
+	_, err := s.db.Exec(query, time.Now().Add(delay), reason, jobID)
+	if err != nil {
+		return fmt.Errorf("falha ao reenfileirar job '%s': %w", jobID, err)
+	}
+	return nil
+}
+
+// RequeueRunningJobs devolve para PENDING todos os jobs ainda em RUNNING sem
+// consumir tentativas de retry. Deve ser chamado no encerramento gracioso: como
+// a parada foi ordenada e não uma falha, o job não pode ser penalizado.
+// Difere de ResetRunningJobs, que trata queda abrupta e incrementa retry_count
+// para preservar a proteção contra jobs venenosos.
+func (s *Store) RequeueRunningJobs(reason string) (int64, error) {
+	query := `
+	UPDATE jobs
+	SET status = 'PENDING', locked_by = NULL, locked_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP
+	WHERE status = 'RUNNING';
+	`
+	res, err := s.db.Exec(query, reason)
+	if err != nil {
+		return 0, fmt.Errorf("falha ao reenfileirar jobs em RUNNING: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // MarkJobBlocked marca o job como bloqueado (ex.: por conflito insolúvel de merge).
 func (s *Store) MarkJobBlocked(jobID string, reason string) error {
 	query := `
@@ -405,6 +457,172 @@ func (s *Store) ListPendingJobs(watcherID string) ([]*Job, error) {
 	return jobs, rows.Err()
 }
 
+// DefaultRetention é a janela padrão de histórico preservado.
+const DefaultRetention = 7 * 24 * time.Hour
+
+// PurgeResult resume o que foi removido em uma passagem de retenção.
+type PurgeResult struct {
+	Jobs int64
+	Runs int64
+}
+
+// PurgeOldRecords remove jobs terminais e execuções de pipeline mais antigos que
+// a janela informada. Sem isso o state.db cresce indefinidamente: com debounce
+// de 15s, um único watcher pode gerar milhares de linhas por dia, degradando
+// progressivamente o dequeue e ocupando disco sem limite.
+//
+// Jobs em PENDING, RUNNING ou BLOCKED nunca são removidos: representam trabalho
+// não concluído ou conflitos aguardando o usuário.
+func (s *Store) PurgeOldRecords(retention time.Duration) (*PurgeResult, error) {
+	if retention <= 0 {
+		retention = DefaultRetention
+	}
+
+	// created_at/updated_at são gravados pelo SQLite via CURRENT_TIMESTAMP, que
+	// é UTC. Comparar com um time.Time do Go (local) desloca o corte pelo offset
+	// do fuso: em UTC-3 nada seria purgado, e em UTC+9 histórico recente seria
+	// apagado cedo demais. Calcular o corte dentro do próprio SQLite mantém os
+	// dois lados no mesmo relógio e no mesmo formato.
+	cutoff := fmt.Sprintf("-%d seconds", int64(retention.Seconds()))
+
+	res := &PurgeResult{}
+
+	// pipeline_runs.job_id referencia jobs(id) sem ON DELETE, então a remoção de
+	// um job que ainda tenha execuções apontando para ele violaria a foreign key
+	// e abortaria a manutenção inteira. As execuções saem primeiro: por idade e,
+	// em seguida, as que pertencem aos jobs prestes a serem removidos.
+	runRes, err := s.db.Exec(
+		`DELETE FROM pipeline_runs WHERE created_at < datetime('now', ?);`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao purgar histórico de execuções: %w", err)
+	}
+	res.Runs, _ = runRes.RowsAffected()
+
+	orphanRes, err := s.db.Exec(`
+		DELETE FROM pipeline_runs
+		WHERE job_id IN (
+			SELECT id FROM jobs
+			WHERE status IN ('COMPLETED', 'FAILED') AND updated_at < datetime('now', ?)
+		);`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao purgar execuções de jobs expirados: %w", err)
+	}
+	if n, _ := orphanRes.RowsAffected(); n > 0 {
+		res.Runs += n
+	}
+
+	jobRes, err := s.db.Exec(
+		`DELETE FROM jobs WHERE status IN ('COMPLETED', 'FAILED') AND updated_at < datetime('now', ?);`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao purgar jobs concluídos: %w", err)
+	}
+	res.Jobs, _ = jobRes.RowsAffected()
+
+	return res, nil
+}
+
+// CountJobsByStatus retorna a quantidade de jobs agrupada por status.
+func (s *Store) CountJobsByStatus() (map[JobStatus]int, error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM jobs GROUP BY status;`)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao contar jobs por status: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	counts := make(map[JobStatus]int)
+	for rows.Next() {
+		var (
+			status JobStatus
+			n      int
+		)
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		counts[status] = n
+	}
+	return counts, rows.Err()
+}
+
+// DefaultListLimit limita consultas de listagem quando nenhum limite é informado.
+const DefaultListLimit = 50
+
+// ListRecentJobs retorna os jobs mais recentemente atualizados, de qualquer
+// status. Diferente de ListPendingJobs, serve à inspeção do estado da fila
+// (CLI e TUI), por isso inclui last_error e o momento da última atualização.
+func (s *Store) ListRecentJobs(watcherID string, limit int) ([]*Job, error) {
+	if limit <= 0 {
+		limit = DefaultListLimit
+	}
+
+	query := `
+	SELECT id, watcher_id, pipeline_name, status, payload_files, retry_count, max_retries,
+	       scheduled_for, COALESCE(last_error, ''), created_at, updated_at
+	FROM jobs
+	WHERE (watcher_id = ? OR ? = '')
+	ORDER BY updated_at DESC, created_at DESC
+	LIMIT ?;
+	`
+	rows, err := s.db.Query(query, watcherID, watcherID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao listar jobs recentes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var jobs []*Job
+	for rows.Next() {
+		var (
+			j           Job
+			payloadText string
+		)
+		if err := rows.Scan(
+			&j.ID, &j.WatcherID, &j.PipelineName, &j.Status, &payloadText,
+			&j.RetryCount, &j.MaxRetries, &j.ScheduledFor, &j.LastError,
+			&j.CreatedAt, &j.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(payloadText), &j.PayloadFiles); err != nil {
+			return nil, fmt.Errorf("falha ao deserializar arquivos do job '%s': %w", j.ID, err)
+		}
+		jobs = append(jobs, &j)
+	}
+	return jobs, rows.Err()
+}
+
+// ListRecentRuns retorna o histórico de auditoria mais recente.
+func (s *Store) ListRecentRuns(watcherID string, limit int) ([]*PipelineRun, error) {
+	if limit <= 0 {
+		limit = DefaultListLimit
+	}
+
+	query := `
+	SELECT id, COALESCE(job_id, ''), watcher_id, pipeline_name, status,
+	       COALESCE(duration_ms, 0), COALESCE(error_step, ''), COALESCE(error_details, ''), created_at
+	FROM pipeline_runs
+	WHERE (watcher_id = ? OR ? = '')
+	ORDER BY created_at DESC, id DESC
+	LIMIT ?;
+	`
+	rows, err := s.db.Query(query, watcherID, watcherID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao listar execuções recentes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var runs []*PipelineRun
+	for rows.Next() {
+		var r PipelineRun
+		if err := rows.Scan(
+			&r.ID, &r.JobID, &r.WatcherID, &r.PipelineName, &r.Status,
+			&r.DurationMs, &r.ErrorStep, &r.ErrorDetails, &r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		runs = append(runs, &r)
+	}
+	return runs, rows.Err()
+}
+
 // ResetRunningJobs reverte jobs presos em RUNNING (ex.: após crash de energia) para PENDING ou FAILED se esgotar tentativas.
 func (s *Store) ResetRunningJobs() (int64, error) {
 	query := `
@@ -433,7 +651,14 @@ func (s *Store) RecordPipelineRun(run *PipelineRun) error {
 	INSERT INTO pipeline_runs (id, job_id, watcher_id, pipeline_name, status, duration_ms, error_step, error_details, created_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
 	`
-	_, err := s.db.Exec(query, run.ID, run.JobID, run.WatcherID, run.PipelineName, run.Status, run.DurationMs, run.ErrorStep, run.ErrorDetails)
+	// job_id é anulável no schema e tem foreign key para jobs(id): gravar string
+	// vazia violaria a constraint em vez de representar "sem job associado".
+	var jobID any
+	if run.JobID != "" {
+		jobID = run.JobID
+	}
+
+	_, err := s.db.Exec(query, run.ID, jobID, run.WatcherID, run.PipelineName, run.Status, run.DurationMs, run.ErrorStep, run.ErrorDetails)
 	if err != nil {
 		return fmt.Errorf("falha ao registrar execução de pipeline: %w", err)
 	}
