@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -8,8 +9,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/watchflow/watchflow/internal/config"
@@ -44,7 +47,7 @@ type CheckResult struct {
 var doctorCmd = &cobra.Command{
 	Use:   "doctor",
 	Short: "Diagnostica os pré-requisitos do sistema e a saúde do ambiente WatchFlow",
-	Long:  `Inspeciona limites de inotify do kernel Linux, versão do Git, permissões de disco, integridade da base SQLite e estado do daemon.`,
+	Long:  `Inspeciona limites de inotify do kernel Linux, versão do Git, permissões de disco, integridade e tamanho do WAL da base SQLite, a unidade systemd do usuário e o estado do daemon.`,
 	RunE:  runDoctor,
 }
 
@@ -84,11 +87,17 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 	results = append(results, checkStateDirectory(stateDir)...)
 
-	// 4. Socket IPC e Daemon
+	// 3b. Merge drivers referenciados pelos repositórios vigiados
+	results = append(results, checkMergeDrivers(cfg)...)
+
+	// 4. Unidade systemd do usuário
+	results = append(results, checkServiceUnit())
+
+	// 5. Socket IPC e Daemon
 	sockPath := resolveSocketPath()
 	results = append(results, checkIPCSocket(sockPath))
 
-	// 5. Repositórios dos Watchers configurados
+	// 6. Repositórios dos Watchers configurados
 	if cfg != nil {
 		results = append(results, checkWatchers(cfg)...)
 	}
@@ -360,6 +369,8 @@ func checkStateDirectory(stateDir string) []CheckResult {
 				})
 			}
 		}
+
+		res = append(res, checkWALSize(dbPath))
 	} else {
 		res = append(res, CheckResult{
 			Category: "Armazenamento",
@@ -370,6 +381,332 @@ func checkStateDirectory(stateDir string) []CheckResult {
 	}
 
 	return res
+}
+
+// builtinMergeDrivers são os drivers que o Git resolve sozinho; só os demais
+// exigem uma definição em 'merge.<nome>.driver'.
+var builtinMergeDrivers = map[string]bool{"text": true, "binary": true, "union": true}
+
+// checkMergeDrivers detecta a metade faltante de uma configuração de merge
+// driver personalizada.
+//
+// O .gitattributes é versionado e chega junto com o clone; a definição do driver
+// mora em 'git config --local' e NÃO viaja. Quando só a primeira metade existe,
+// o Git não reclama: ele volta silenciosamente ao merge de texto padrão e produz
+// conflito no primeiro merge concorrente — que, para o WatchFlow, significa
+// watcher em CONFLICT_HALTED. A armadilha se rearma a cada clone novo.
+func checkMergeDrivers(cfg *config.Config) []CheckResult {
+	if cfg == nil || len(cfg.Watchers) == 0 {
+		return nil
+	}
+
+	var results []CheckResult
+
+	for i := range cfg.Watchers {
+		w := &cfg.Watchers[i]
+		if !w.IsEnabled() {
+			continue
+		}
+
+		path := w.ResolvedPath
+		if path == "" {
+			path = config.ExpandPath(w.Path)
+		}
+		if !config.IsGitRepo(path) {
+			// checkWatchedRepos já reporta esse caso; repetir aqui só polui.
+			continue
+		}
+
+		drivers := mergeDriversInAttributes(readGitAttributes(path))
+		if len(drivers) == 0 {
+			continue
+		}
+
+		var missing []string
+		for _, name := range drivers {
+			if !hasMergeDriver(path, name) {
+				missing = append(missing, name)
+			}
+		}
+
+		if len(missing) > 0 {
+			results = append(results, CheckResult{
+				Category: "Merge Drivers",
+				Name:     w.Name,
+				Status:   StatusWarn,
+				Message: fmt.Sprintf("'.gitattributes' referencia o driver '%s', que não está definido neste clone; o Git cai no merge padrão e gera conflito sem avisar",
+					strings.Join(missing, "', '")),
+				Remediation: fmt.Sprintf("Defina o driver no repositório, por exemplo: git -C '%s' config --local merge.%s.driver '<comando>'", path, missing[0]),
+			})
+			continue
+		}
+
+		results = append(results, CheckResult{
+			Category: "Merge Drivers",
+			Name:     w.Name,
+			Status:   StatusOK,
+			Message:  fmt.Sprintf("driver(s) '%s' definido(s) neste clone", strings.Join(drivers, "', '")),
+		})
+	}
+
+	return results
+}
+
+// readGitAttributes concatena as duas origens de atributos que valem para o
+// repositório inteiro: a versionada e a local. Atributos em subdiretórios ficam
+// de fora — no uso típico (um cofre) as regras vivem na raiz.
+func readGitAttributes(repoPath string) string {
+	var b strings.Builder
+	for _, rel := range []string{".gitattributes", filepath.Join(".git", "info", "attributes")} {
+		data, err := os.ReadFile(filepath.Join(repoPath, rel)) // #nosec G304 -- caminho derivado da configuração
+		if err == nil {
+			b.Write(data)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// mergeDriversInAttributes extrai os nomes de driver personalizados declarados
+// como 'merge=<nome>'. As formas '-merge' e '!merge' não nomeiam driver algum.
+func mergeDriversInAttributes(content string) []string {
+	seen := make(map[string]bool)
+	var names []string
+
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		// O primeiro campo é o padrão de caminho, nunca um atributo.
+		for _, field := range fields[1:] {
+			name, ok := strings.CutPrefix(field, "merge=")
+			if !ok || name == "" || builtinMergeDrivers[name] || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+
+	sort.Strings(names)
+	return names
+}
+
+// hasMergeDriver informa se o clone define o comando do driver. Só '.driver'
+// importa: '.name' é rótulo descritivo e sua ausência não quebra o merge.
+func hasMergeDriver(repoPath, name string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "config", "--get", "merge."+name+".driver")
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// serviceUnitName é a unidade de usuário instalada por scripts/install.sh.
+const serviceUnitName = "watchflow.service"
+
+// checkServiceUnit inspeciona a unidade systemd do usuário.
+//
+// Existe porque o check de socket logo abaixo só prova que *algum* daemon
+// responde — ele não distingue um processo manual preso a um terminal de um
+// serviço gerenciado, nem enxerga uma unidade em loop de restart, que falha e
+// volta a cada RestartSec sem nunca chegar a executar o binário.
+func checkServiceUnit() CheckResult {
+	const category = "Serviço"
+
+	if runtime.GOOS != "linux" {
+		return CheckResult{
+			Category: category,
+			Name:     "systemd Unit",
+			Status:   StatusInfo,
+			Message:  fmt.Sprintf("sistema operacional não-Linux (%s); unidade systemd não aplicável", runtime.GOOS),
+		}
+	}
+
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return CheckResult{
+			Category: category,
+			Name:     "systemd Unit",
+			Status:   StatusInfo,
+			Message:  "systemctl não encontrado no PATH; o daemon precisa ser iniciado manualmente",
+		}
+	}
+
+	props, err := systemdProperties(serviceUnitName)
+	if err != nil {
+		return CheckResult{
+			Category: category,
+			Name:     "systemd Unit",
+			Status:   StatusInfo,
+			Message:  fmt.Sprintf("não foi possível consultar o systemd do usuário: %v", err),
+		}
+	}
+
+	return evaluateServiceUnit(props)
+}
+
+// evaluateServiceUnit traduz as propriedades da unidade em diagnóstico. Fica
+// separada da coleta para que cada estado — inclusive o loop de reinício, que é
+// incômodo de reproduzir de propósito — seja coberto por teste.
+func evaluateServiceUnit(props map[string]string) CheckResult {
+	const category = "Serviço"
+
+	// LoadState distingue "unidade inexistente" de "unidade com problema": sem
+	// essa checagem, quem roda o daemon à mão receberia um alarme falso.
+	if props["LoadState"] == "not-found" {
+		return CheckResult{
+			Category:    category,
+			Name:        "systemd Unit",
+			Status:      StatusInfo,
+			Message:     fmt.Sprintf("unidade '%s' não instalada; o daemon depende de inicialização manual e morre junto com o terminal (SIGHUP)", serviceUnitName),
+			Remediation: "Instale o serviço com ./install.sh para que o daemon sobreviva ao fechamento do terminal",
+		}
+	}
+
+	restarts := props["NRestarts"]
+	autoStart := "sem auto-start no login"
+	if props["UnitFileState"] == "enabled" {
+		autoStart = "auto-start habilitado"
+	}
+
+	switch {
+	// activating + auto-restart é o loop de falha: a unidade nunca alcança
+	// 'active', então nem status nem socket denunciam o problema.
+	case props["ActiveState"] == "activating" && props["SubState"] == "auto-restart":
+		return CheckResult{
+			Category:    category,
+			Name:        "systemd Unit",
+			Status:      StatusFail,
+			Message:     fmt.Sprintf("unidade em loop de reinício (%s restarts, Result=%s); o daemon nunca chega a subir pelo serviço", restarts, props["Result"]),
+			Remediation: fmt.Sprintf("Inspecione a causa com: journalctl --user -u %s -n 50 --no-pager", serviceUnitName),
+		}
+
+	case props["ActiveState"] == "failed":
+		return CheckResult{
+			Category:    category,
+			Name:        "systemd Unit",
+			Status:      StatusFail,
+			Message:     fmt.Sprintf("unidade em estado 'failed' (Result=%s)", props["Result"]),
+			Remediation: fmt.Sprintf("Inspecione a causa com: journalctl --user -u %s -n 50 --no-pager", serviceUnitName),
+		}
+
+	case props["ActiveState"] == "active":
+		msg := fmt.Sprintf("unidade ativa e gerenciada pelo systemd (%s)", autoStart)
+		if restarts != "" && restarts != "0" {
+			// Reinícios acumulados com a unidade ativa indicam instabilidade
+			// intermitente, que o estado atual sozinho esconde.
+			return CheckResult{
+				Category:    category,
+				Name:        "systemd Unit",
+				Status:      StatusWarn,
+				Message:     fmt.Sprintf("%s, mas com %s reinícios acumulados", msg, restarts),
+				Remediation: fmt.Sprintf("Verifique quedas anteriores com: journalctl --user -u %s -n 50 --no-pager", serviceUnitName),
+			}
+		}
+		return CheckResult{Category: category, Name: "systemd Unit", Status: StatusOK, Message: msg}
+
+	default:
+		return CheckResult{
+			Category:    category,
+			Name:        "systemd Unit",
+			Status:      StatusInfo,
+			Message:     fmt.Sprintf("unidade instalada mas parada (ActiveState=%s, %s)", props["ActiveState"], autoStart),
+			Remediation: fmt.Sprintf("Inicie o serviço com: systemctl --user start %s", serviceUnitName),
+		}
+	}
+}
+
+// systemdProperties lê propriedades da unidade via 'systemctl show', que sai com
+// status 0 mesmo para unidade inexistente — daí a distinção ficar por conta de
+// LoadState, e não do código de saída.
+func systemdProperties(unit string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "systemctl", "--user", "show", unit,
+		"--property=LoadState",
+		"--property=ActiveState",
+		"--property=SubState",
+		"--property=UnitFileState",
+		"--property=NRestarts",
+		"--property=Result",
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	props := make(map[string]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if found {
+			props[key] = value
+		}
+	}
+	return props, nil
+}
+
+// walHighWaterMark é a marca d'água esperada do WAL em operação normal:
+// wal_autocheckpoint tem 1000 páginas por padrão e o page_size é de 4 KiB, então
+// o arquivo estaciona perto de 4 MiB e só encolhe num checkpoint TRUNCATE. Um
+// WAL muito acima disso indica checkpoint represado por um leitor de vida longa,
+// e não simples acúmulo.
+const walHighWaterMark = 16 << 20
+
+// checkWALSize compara o WAL com o banco. Não é um teste de corrupção — o
+// integrity_check já cobre isso — e sim de crescimento: um WAL represado atrasa
+// a recuperação no próximo start e cresce sem teto prático.
+func checkWALSize(dbPath string) CheckResult {
+	walPath := dbPath + "-wal"
+
+	walInfo, err := os.Stat(walPath)
+	if err != nil {
+		// Ausência do WAL é o estado esperado com o daemon parado após um
+		// encerramento gracioso: o checkpoint TRUNCATE zera e remove o arquivo.
+		return CheckResult{
+			Category: "Armazenamento",
+			Name:     "SQLite WAL",
+			Status:   StatusOK,
+			Message:  "sem WAL pendente (checkpoint aplicado no último encerramento)",
+		}
+	}
+
+	walSize := walInfo.Size()
+	if walSize > walHighWaterMark {
+		return CheckResult{
+			Category:    "Armazenamento",
+			Name:        "SQLite WAL",
+			Status:      StatusWarn,
+			Message:     fmt.Sprintf("WAL com %s, acima da marca d'água esperada de %s: o checkpoint pode estar represado por um leitor de vida longa", humanBytes(walSize), humanBytes(walHighWaterMark)),
+			Remediation: "Pare o daemon ('watchflow stop') para forçar o checkpoint TRUNCATE; se o WAL persistir grande, reporte o caso",
+		}
+	}
+
+	return CheckResult{
+		Category: "Armazenamento",
+		Name:     "SQLite WAL",
+		Status:   StatusOK,
+		Message:  fmt.Sprintf("WAL com %s (dentro da marca d'água de %s)", humanBytes(walSize), humanBytes(walHighWaterMark)),
+	}
+}
+
+// humanBytes formata tamanhos em unidades binárias legíveis no relatório.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
 }
 
 func checkIPCSocket(sockPath string) CheckResult {
