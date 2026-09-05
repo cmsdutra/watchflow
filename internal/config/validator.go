@@ -3,7 +3,11 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
+
+	"github.com/watchflow/watchflow/internal/notify"
+	"github.com/watchflow/watchflow/internal/providers"
 )
 
 var (
@@ -74,6 +78,15 @@ func validateNotifications(n *NotificationConfig) error {
 	if !validNotificationBackends[n.Backend] {
 		return fmt.Errorf("backend '%s' inválido; use: desktop, log, webhook", n.Backend)
 	}
+
+	// Só exige a URL se o backend for de fato usado, para não reprovar
+	// configurações com notificações desligadas.
+	if n.Enabled && n.Backend == "webhook" {
+		if err := notify.ValidateWebhookURL(n.WebhookURL); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -97,6 +110,10 @@ func validatePipelines(pipelines map[string]Pipeline) error {
 
 		p.TimeoutDuration = timeoutDur
 
+		if p.MaxRetries < 0 {
+			return fmt.Errorf("pipeline '%s': max_retries não pode ser negativo (recebido: %d)", name, p.MaxRetries)
+		}
+
 		if len(p.Steps) == 0 {
 			return fmt.Errorf("pipeline '%s': deve conter ao menos um step", name)
 		}
@@ -104,6 +121,22 @@ func validatePipelines(pipelines map[string]Pipeline) error {
 		for idx, step := range p.Steps {
 			if step.Action == "" {
 				return fmt.Errorf("pipeline '%s', step %d: campo 'action' é obrigatório", name, idx+1)
+			}
+
+			// Um typo em 'action' passava na validação e só falhava em runtime
+			// como erro fatal, com o job já enfileirado. O catálogo só está
+			// populado quando os providers foram ligados ao binário; se estiver
+			// vazio a checagem é pulada em vez de reprovar indevidamente.
+			if known := providers.DefaultRegistry.List(); len(known) > 0 {
+				if _, exists := providers.DefaultRegistry.Get(step.Action); !exists {
+					return fmt.Errorf("pipeline '%s', step %d: ação '%s' não existe; disponíveis: %s",
+						name, idx+1, step.Action, strings.Join(known, ", "))
+				}
+
+				action, _ := providers.DefaultRegistry.Get(step.Action)
+				if err := action.Validate(step.Params); err != nil {
+					return fmt.Errorf("pipeline '%s', step %d (%s): %w", name, idx+1, step.Action, err)
+				}
 			}
 		}
 

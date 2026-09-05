@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/watchflow/watchflow/internal/notify"
 )
 
 // Config representa a estrutura canônica de configuração do WatchFlow.
@@ -34,6 +36,22 @@ type NotificationConfig struct {
 	OnError    bool   `yaml:"on_error"`
 	OnConflict bool   `yaml:"on_conflict"`
 	Backend    string `yaml:"backend"`
+
+	// WebhookURL é obrigatório quando Backend == "webhook".
+	WebhookURL string `yaml:"webhook_url,omitempty"`
+}
+
+// NotifyOptions converte a configuração declarada no YAML nas opções do
+// subsistema de notificações.
+func (n *NotificationConfig) NotifyOptions() notify.Options {
+	return notify.Options{
+		Enabled:    n.Enabled,
+		OnSuccess:  n.OnSuccess,
+		OnError:    n.OnError,
+		OnConflict: n.OnConflict,
+		Backend:    n.Backend,
+		WebhookURL: n.WebhookURL,
+	}
 }
 
 // WatcherConfig define o monitoramento para um diretório raiz específico.
@@ -60,13 +78,29 @@ func (w *WatcherConfig) IsEnabled() bool {
 	return *w.Enabled
 }
 
+// DefaultMaxRetries é o número de tentativas aplicado quando o pipeline não
+// declara max_retries.
+const DefaultMaxRetries = 5
+
 // Pipeline define a sequência ordenada de ações com timeout de execução.
 type Pipeline struct {
 	Timeout string `yaml:"timeout"`
 	Steps   []Step `yaml:"steps"`
 
+	// MaxRetries limita as tentativas de um job deste pipeline antes da falha
+	// definitiva. Zero ou omitido usa DefaultMaxRetries.
+	MaxRetries int `yaml:"max_retries,omitempty"`
+
 	// Campos derivados
 	TimeoutDuration time.Duration `yaml:"-"`
+}
+
+// RetryLimit retorna o número efetivo de tentativas do pipeline.
+func (p *Pipeline) RetryLimit() int {
+	if p.MaxRetries <= 0 {
+		return DefaultMaxRetries
+	}
+	return p.MaxRetries
 }
 
 // Step representa uma ação atômica e seus parâmetros de execução dentro de um pipeline.
