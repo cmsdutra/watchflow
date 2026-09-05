@@ -56,18 +56,23 @@ func (n *NotificationConfig) NotifyOptions() notify.Options {
 
 // WatcherConfig define o monitoramento para um diretório raiz específico.
 type WatcherConfig struct {
-	Name      string   `yaml:"name"`
-	Path      string   `yaml:"path"`
-	Enabled   *bool    `yaml:"enabled,omitempty"`
-	Debounce  string   `yaml:"debounce"`
-	MaxWait   string   `yaml:"max_wait"`
-	Ignore    []string `yaml:"ignore"`
-	Pipelines []string `yaml:"pipelines"`
+	Name     string `yaml:"name"`
+	Path     string `yaml:"path"`
+	Enabled  *bool  `yaml:"enabled,omitempty"`
+	Debounce string `yaml:"debounce"`
+	MaxWait  string `yaml:"max_wait"`
+
+	// PullInterval define de quanto em quanto tempo o daemon consulta o remoto
+	// mesmo sem alterações locais. "0" desativa.
+	PullInterval string   `yaml:"pull_interval,omitempty"`
+	Ignore       []string `yaml:"ignore"`
+	Pipelines    []string `yaml:"pipelines"`
 
 	// Campos derivados (preenchidos após o parsing)
-	DebounceDuration time.Duration `yaml:"-"`
-	MaxWaitDuration  time.Duration `yaml:"-"`
-	ResolvedPath     string        `yaml:"-"`
+	DebounceDuration     time.Duration `yaml:"-"`
+	MaxWaitDuration      time.Duration `yaml:"-"`
+	PullIntervalDuration time.Duration `yaml:"-"`
+	ResolvedPath         string        `yaml:"-"`
 }
 
 // IsEnabled retorna true se o watcher estiver ativo (padrão é true quando não especificado).
@@ -81,6 +86,16 @@ func (w *WatcherConfig) IsEnabled() bool {
 // DefaultMaxRetries é o número de tentativas aplicado quando o pipeline não
 // declara max_retries.
 const DefaultMaxRetries = 5
+
+// DefaultPullInterval é a cadência padrão de consulta ao remoto.
+//
+// Sem ela, o daemon só descobre o que outra máquina publicou quando algo muda
+// localmente: você senta no outro computador, abre as notas e elas ainda são as
+// antigas — e pior, pode editar em cima de uma versão desatualizada.
+const DefaultPullInterval = "5m"
+
+// MinPullInterval evita configurar uma cadência que martele o servidor remoto.
+const MinPullInterval = 30 * time.Second
 
 // DefaultPipelineName é o nome do pipeline embutido, atribuído a watchers que
 // não declaram nenhum.
@@ -214,6 +229,9 @@ func applyDefaults(cfg *Config) {
 		}
 		if w.MaxWait == "" {
 			w.MaxWait = "60s"
+		}
+		if w.PullInterval == "" {
+			w.PullInterval = DefaultPullInterval
 		}
 		w.ResolvedPath = ExpandPath(w.Path)
 

@@ -35,6 +35,10 @@ const (
 	conflictHoldDelay = 30 * time.Second
 	// ipcBindTimeout limita a espera pela vinculação do socket de controle.
 	ipcBindTimeout = 5 * time.Second
+	// initialPullDelay é a espera antes da primeira consulta ao remoto, curta o
+	// bastante para ser imediata na prática e longa o bastante para o daemon
+	// terminar de subir.
+	initialPullDelay = 3 * time.Second
 	// maintenanceInterval é a cadência da rotina de manutenção (retenção do
 	// banco e coleta do supressor de eco).
 	maintenanceInterval = 1 * time.Hour
@@ -62,9 +66,12 @@ type Coordinator struct {
 	drainWg        sync.WaitGroup
 	mu             sync.RWMutex
 	paused         map[string]bool
-	version        string
-	log            *slog.Logger
-	notifier       notify.Notifier
+	// lastEnqueue evita que a consulta periódica ao remoto gere trabalho
+	// redundante logo depois de uma sincronização disparada por edição local.
+	lastEnqueue map[string]time.Time
+	version     string
+	log         *slog.Logger
+	notifier    notify.Notifier
 }
 
 // NewCoordinator instancia o coordenador central, configurando o banco SQLite e preparando o estado.
@@ -129,6 +136,7 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 		filters:        make(map[string]*normalizer.Filter),
 		watcherCancels: make(map[string]context.CancelFunc),
 		paused:         make(map[string]bool),
+		lastEnqueue:    make(map[string]time.Time),
 		version:        appVersion,
 		log:            log,
 		notifier:       notify.New(cfg.Notifications.NotifyOptions()),
@@ -285,14 +293,108 @@ func (c *Coordinator) startWatcher(parent context.Context, wCfg config.WatcherCo
 	w.Start(watcherCtx)
 	deb.Start(watcherCtx)
 
+	if wCfg.PullIntervalDuration > 0 {
+		go c.pullLoop(watcherCtx, wCfg)
+	}
+
 	c.log.Info("watcher ativo",
 		slog.String("watcher", wCfg.Name),
 		slog.String("path", targetPath),
 		slog.Int("diretorios_vigiados", len(w.WatchedDirs())),
 		slog.Duration("debounce", wCfg.DebounceDuration),
-		slog.Duration("max_wait", wCfg.MaxWaitDuration))
+		slog.Duration("max_wait", wCfg.MaxWaitDuration),
+		slog.Duration("pull_interval", wCfg.PullIntervalDuration))
 
 	return nil
+}
+
+// pullLoop consulta o remoto periodicamente, mesmo sem alterações locais.
+//
+// Toda a captura parte de eventos do sistema de arquivos local; sem este laço,
+// o que outra máquina publica só chega quando o usuário edita algo aqui — e ele
+// pode acabar editando em cima de uma versão desatualizada.
+//
+// O job enfileirado é o mesmo pipeline de sempre: sem alterações locais, 'add' e
+// 'commit' se pulam sozinhos, 'safe_sync' traz o que houver e 'push' reporta que
+// já está em dia. Não é preciso um pipeline separado só para trazer.
+func (c *Coordinator) pullLoop(ctx context.Context, wCfg config.WatcherConfig) {
+	log := c.log.With(
+		slog.String("watcher", wCfg.Name),
+		slog.String("rotina", "pull_periodico"))
+
+	ticker := time.NewTicker(wCfg.PullIntervalDuration)
+	defer ticker.Stop()
+
+	// A primeira consulta acontece logo no início, e não após um intervalo
+	// inteiro. O momento em que a máquina acabou de ligar é exatamente aquele em
+	// que ela está mais desatualizada: esperar 5 minutos para descobrir o que as
+	// outras máquinas publicaram enquanto ela estava desligada é o pior caso
+	// possível — e é quando o usuário mais provavelmente vai abrir as notas e
+	// editar em cima de uma versão velha.
+	initial := time.NewTimer(initialPullDelay)
+	defer initial.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-initial.C:
+		case <-ticker.C:
+		}
+
+		if skip, reason := c.shouldSkipPull(wCfg); skip {
+			log.Debug("consulta periódica ao remoto pulada", slog.String("motivo", reason))
+			continue
+		}
+
+		for _, pipeName := range wCfg.Pipelines {
+			jobID := fmt.Sprintf("pull_%d_%s_%s", time.Now().UnixNano(), wCfg.Name, pipeName)
+			job := &queue.Job{
+				ID:           jobID,
+				WatcherID:    wCfg.Name,
+				PipelineName: pipeName,
+				PayloadFiles: []string{},
+				MaxRetries:   c.retryLimitFor(pipeName),
+			}
+
+			if err := c.store.EnqueueJob(job); err != nil {
+				log.Error("falha ao enfileirar consulta periódica ao remoto",
+					slog.String("job_id", jobID), slog.Any("error", err))
+				continue
+			}
+			log.Debug("consulta periódica ao remoto enfileirada", slog.String("job_id", jobID))
+		}
+
+		c.markEnqueued(wCfg.Name)
+	}
+}
+
+// shouldSkipPull evita trabalho inútil: um watcher pausado ou interrompido por
+// conflito não deve acumular jobs, e uma sincronização recente já trouxe o que
+// havia no remoto.
+func (c *Coordinator) shouldSkipPull(wCfg config.WatcherConfig) (bool, string) {
+	c.mu.RLock()
+	isPaused := c.paused[wCfg.Name]
+	last := c.lastEnqueue[wCfg.Name]
+	c.mu.RUnlock()
+
+	switch {
+	case isPaused:
+		return true, "watcher pausado"
+	case c.isConflictHalted(wCfg.Name):
+		return true, "watcher aguardando resolução de conflito"
+	case !last.IsZero() && time.Since(last) < wCfg.PullIntervalDuration:
+		return true, "sincronização recente disparada por alteração local"
+	}
+
+	return false, ""
+}
+
+// markEnqueued registra que o watcher acabou de gerar trabalho.
+func (c *Coordinator) markEnqueued(name string) {
+	c.mu.Lock()
+	c.lastEnqueue[name] = time.Now()
+	c.mu.Unlock()
 }
 
 // stopWatcher encerra um watcher específico. O debouncer descarrega o lote
@@ -405,6 +507,8 @@ func (c *Coordinator) bindWatcherPipeline(
 			// Um watcher pausado NÃO descarta o lote: o job é persistido e
 			// aguarda na fila até o resume. Descartar aqui perderia alterações
 			// reais do usuário em silêncio.
+			c.markEnqueued(wCfg.Name)
+
 			log.Info("lote de alterações consolidado",
 				slog.Int("arquivos", len(batch.Files)),
 				slog.Int("eventos", batch.EventsCount),

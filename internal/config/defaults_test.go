@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/watchflow/watchflow/internal/config"
 )
@@ -250,4 +251,66 @@ func mustLoad(t *testing.T, yaml string) *config.Config {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+// TestPullIntervalDefaultsToFiveMinutes: sem consulta periódica, o que outra
+// máquina publica só chega quando algo muda localmente — e o usuário pode
+// acabar editando em cima de uma versão desatualizada.
+func TestPullIntervalDefaultsToFiveMinutes(t *testing.T) {
+	repo := gitRepo(t, true)
+
+	cfg, err := config.LoadBytes([]byte("watchers:\n  - name: c\n    path: "+repo+"\n"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cfg.Watchers[0].PullIntervalDuration; got != 5*time.Minute {
+		t.Errorf("esperava 5m por padrão, obteve %v", got)
+	}
+}
+
+func TestPullIntervalZeroDisables(t *testing.T) {
+	repo := gitRepo(t, true)
+
+	cfg, err := config.LoadBytes([]byte("watchers:\n  - name: c\n    path: "+repo+"\n    pull_interval: \"0\"\n"), true)
+	if err != nil {
+		t.Fatalf("'0' deveria ser aceito para desativar: %v", err)
+	}
+	if cfg.Watchers[0].PullIntervalDuration != 0 {
+		t.Errorf("esperava 0 (desativado), obteve %v", cfg.Watchers[0].PullIntervalDuration)
+	}
+}
+
+// TestPullIntervalRejectsAggressiveValues protege o servidor remoto de uma
+// cadência que o marteleria.
+func TestPullIntervalRejectsAggressiveValues(t *testing.T) {
+	repo := gitRepo(t, true)
+
+	for _, bad := range []string{"1s", "5s", "29s"} {
+		_, err := config.LoadBytes([]byte("watchers:\n  - name: c\n    path: "+repo+"\n    pull_interval: \""+bad+"\"\n"), true)
+		if err == nil {
+			t.Errorf("pull_interval de %s deveria ser recusado", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "no mínimo") {
+			t.Errorf("a mensagem deveria indicar o mínimo aceito: %v", err)
+		}
+	}
+
+	// No limite e acima, aceito
+	for _, ok := range []string{"30s", "5m", "1h"} {
+		if _, err := config.LoadBytes([]byte("watchers:\n  - name: c\n    path: "+repo+"\n    pull_interval: \""+ok+"\"\n"), true); err != nil {
+			t.Errorf("pull_interval de %s deveria ser aceito: %v", ok, err)
+		}
+	}
+}
+
+func TestPullIntervalRejectsNegativeAndMalformed(t *testing.T) {
+	repo := gitRepo(t, true)
+
+	for _, bad := range []string{"-5m", "toda hora", "5"} {
+		if _, err := config.LoadBytes([]byte("watchers:\n  - name: c\n    path: "+repo+"\n    pull_interval: \""+bad+"\"\n"), true); err == nil {
+			t.Errorf("pull_interval %q deveria ser recusado", bad)
+		}
+	}
 }

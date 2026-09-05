@@ -44,6 +44,12 @@ watchers:
     # Teto máximo absoluto de espera: força o despacho mesmo se houver escrita contínua
     max_wait: "60s"
 
+    # De quanto em quanto tempo consultar o remoto mesmo sem alterações locais.
+    # Sem isso, o que outra máquina publicar só chega quando você editar algo
+    # aqui. A primeira consulta acontece logo após o daemon subir, e não depois
+    # de um intervalo inteiro. Use "0" para desativar; o mínimo aceito é 30s.
+    pull_interval: "5m"
+
     # Padrões glob de caminhos a serem descartados imediatamente (< 1ms)
     ignore:
       - ".git/**"

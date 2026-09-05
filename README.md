@@ -88,6 +88,17 @@ vez que o programa subir, ele retoma de onde parou.
 
 Estas não são promessas de marketing; são as regras que guiam o código.
 
+### Ele funciona nos dois sentidos
+
+Além de enviar o que você muda, ele traz o que as outras máquinas publicaram.
+
+Isso acontece em três momentos: quando você edita qualquer arquivo local, a cada
+`pull_interval` (5 minutos por padrão), e alguns segundos depois de o daemon
+subir — porque o instante em que a máquina acaba de ligar é justamente aquele em
+que ela está mais desatualizada.
+
+Para forçar a qualquer momento: `watchflow sync`, ou a tecla `s` na TUI.
+
 ### Seus arquivos nunca são sobrescritos
 
 O WatchFlow **não usa `git pull`**. Em vez disso, ele busca as mudanças do
@@ -282,8 +293,9 @@ notifications:
 watchers:
   - name: "meu-cofre"
     path: "~/Anotacoes"
-    debounce: "15s"      # espera de silêncio antes de agir
-    max_wait: "60s"      # teto máximo de espera
+    debounce: "15s"        # espera de silêncio antes de agir
+    max_wait: "60s"        # teto máximo de espera
+    pull_interval: "5m"    # consulta o remoto mesmo sem alterações locais ("0" desativa)
     ignore:
       - ".git/**"
       - ".obsidian/cache/**"

@@ -197,6 +197,19 @@ func validateWatchers(watchers []WatcherConfig, pipelines map[string]Pipeline, c
 		}
 		w.MaxWaitDuration = maxWaitDur
 
+		pullDur, err := time.ParseDuration(w.PullInterval)
+		if err != nil {
+			return fmt.Errorf("watcher '%s': valor de pull_interval '%s' inválido: %w", w.Name, w.PullInterval, err)
+		}
+		if pullDur < 0 {
+			return fmt.Errorf("watcher '%s': pull_interval não pode ser negativo", w.Name)
+		}
+		if pullDur > 0 && pullDur < MinPullInterval {
+			return fmt.Errorf("watcher '%s': pull_interval de %s é curto demais; use no mínimo %s ou 0 para desativar",
+				w.Name, w.PullInterval, MinPullInterval)
+		}
+		w.PullIntervalDuration = pullDur
+
 		if len(w.Pipelines) == 0 {
 			return fmt.Errorf("watcher '%s': deve referenciar ao menos um pipeline", w.Name)
 		}
