@@ -86,6 +86,7 @@ func TestDefaultRegistry(t *testing.T) {
 	if err := providers.Register(p); err != nil {
 		t.Fatalf("falha ao registrar no DefaultRegistry: %v", err)
 	}
+	t.Cleanup(func() { providers.Unregister(p.Name()) })
 
 	found, ok := providers.Get("default.test.action")
 	if !ok || found == nil {
