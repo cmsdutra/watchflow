@@ -427,6 +427,19 @@ func TestClassifyError(t *testing.T) {
 			expected: pipeline.CategoryTransient,
 		},
 		{
+			// Regressão: duas máquinas empurrando para o mesmo ref fazem o
+			// servidor recusar o lock da perdedora. A mensagem do GitHub é
+			// "[remote rejected]", que NÃO contém a substring "[rejected]" da
+			// lista de transitórios — sem indicador próprio isso caía em FATAL
+			// e o job morria sem nenhuma das 5 tentativas.
+			name: "Transitório por disputa do ref remoto",
+			err: errors.New(`git push origin main: To https://github.com/exemplo/cofre.git
+ ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at 8666370318d6a5ac6afaeab8fe47cd339baa1163 but expected dca3986370808a1ad0d8a01012b4e16b46873064)
+error: failed to push some refs to 'https://github.com/exemplo/cofre.git'`),
+			res:      nil,
+			expected: pipeline.CategoryTransient,
+		},
+		{
 			name:     "Transitório por timeout",
 			err:      context.DeadlineExceeded,
 			res:      nil,

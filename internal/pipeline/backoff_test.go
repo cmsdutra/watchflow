@@ -29,6 +29,17 @@ func TestClassifyBackoffSeparatesContentionFromOutage(t *testing.T) {
 			pipeline.BackoffContention,
 		},
 		{
+			// Disputa do lock do ref é contenção, não queda de rede: o recuo
+			// curto é o certo, senão a convergência entre duas máquinas ativas
+			// só atrasa.
+			"lock do ref disputado por outra máquina",
+			errors.New(`git push origin main: To https://github.com/exemplo/cofre.git
+ ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at 8666370318d6a5ac6afaeab8fe47cd339baa1163 but expected dca3986370808a1ad0d8a01012b4e16b46873064)
+error: failed to push some refs to 'https://github.com/exemplo/cofre.git'`),
+			nil,
+			pipeline.BackoffContention,
+		},
+		{
 			"detectado via StepResult",
 			errors.New("falha"),
 			&providers.StepResult{ErrorMessage: "git push falhou: non-fast-forward"},

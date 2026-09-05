@@ -141,6 +141,11 @@ func ClassifyError(err error, res *providers.StepResult) ErrorCategory {
 			"non-fast-forward",
 			"[rejected]",
 			"fetch first",
+			// O servidor recusa o lock quando o ref se move entre o cálculo do
+			// push e a gravação. Note que a mensagem do GitHub é
+			// "[remote rejected]", que NÃO contém a substring "[rejected]"
+			// acima — daí precisar de indicador próprio.
+			"cannot lock ref",
 		}
 		for _, indicator := range transientIndicators {
 			if strings.Contains(errLower, indicator) {
@@ -182,6 +187,10 @@ var contentionIndicators = []string{
 	"[rejected]",
 	"updates were rejected",
 	"tip of your current branch is behind",
+	// Duas máquinas empurrando para o mesmo ref: a perdedora recebe isto. É
+	// contenção pura, então o recuo curto é o certo — recuar como se a rede
+	// tivesse caído só atrasaria a convergência.
+	"cannot lock ref",
 }
 
 // ClassifyBackoff decide o perfil de espera de uma falha transitória.
