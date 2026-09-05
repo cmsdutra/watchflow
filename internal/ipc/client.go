@@ -118,6 +118,15 @@ func (c *Client) Runs(ctx context.Context, watcherName string, limit int) (*Runs
 	return &res, nil
 }
 
+// Reload solicita que o daemon releia o arquivo de configuração.
+func (c *Client) Reload(ctx context.Context) (*ReloadResponse, error) {
+	var res ReloadResponse
+	if err := c.Call(ctx, "reload", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Sync solicita a sincronização imediata de um watcher ou de todos se watcherName for vazio.
 func (c *Client) Sync(ctx context.Context, watcherName string) (*SyncResponse, error) {
 	var resp SyncResponse

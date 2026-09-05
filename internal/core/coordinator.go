@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,16 +50,21 @@ type Coordinator struct {
 	watchers   map[string]*watcher.Watcher
 	debouncers map[string]*debouncer.Debouncer
 	filters    map[string]*normalizer.Filter
-	startTime  time.Time
-	cancel     context.CancelFunc
-	cancelExec context.CancelFunc
-	workerWg   sync.WaitGroup
-	drainWg    sync.WaitGroup
-	mu         sync.RWMutex
-	paused     map[string]bool
-	version    string
-	log        *slog.Logger
-	notifier   notify.Notifier
+	// watcherCancels permite parar um watcher isoladamente, sem derrubar os
+	// demais — é o que torna a recarga a quente possível.
+	watcherCancels map[string]context.CancelFunc
+	captureCtx     context.Context
+	cfgPath        string
+	startTime      time.Time
+	cancel         context.CancelFunc
+	cancelExec     context.CancelFunc
+	workerWg       sync.WaitGroup
+	drainWg        sync.WaitGroup
+	mu             sync.RWMutex
+	paused         map[string]bool
+	version        string
+	log            *slog.Logger
+	notifier       notify.Notifier
 }
 
 // NewCoordinator instancia o coordenador central, configurando o banco SQLite e preparando o estado.
@@ -114,22 +121,31 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 	runner := pipeline.NewRunner(store, providers.DefaultRegistry, cfg)
 
 	c := &Coordinator{
-		cfg:        cfg,
-		store:      store,
-		runner:     runner,
-		watchers:   make(map[string]*watcher.Watcher),
-		debouncers: make(map[string]*debouncer.Debouncer),
-		filters:    make(map[string]*normalizer.Filter),
-		paused:     make(map[string]bool),
-		version:    appVersion,
-		log:        log,
-		notifier:   notify.New(cfg.Notifications.NotifyOptions()),
+		cfg:            cfg,
+		store:          store,
+		runner:         runner,
+		watchers:       make(map[string]*watcher.Watcher),
+		debouncers:     make(map[string]*debouncer.Debouncer),
+		filters:        make(map[string]*normalizer.Filter),
+		watcherCancels: make(map[string]context.CancelFunc),
+		paused:         make(map[string]bool),
+		version:        appVersion,
+		log:            log,
+		notifier:       notify.New(cfg.Notifications.NotifyOptions()),
 	}
 
 	sockPath := config.ExpandPath(cfg.Daemon.SocketPath)
 	c.ipcServer = ipc.NewServer(sockPath, c)
 
 	return c, nil
+}
+
+// SetConfigPath registra de onde a configuração foi lida, para que 'reload'
+// possa reler o mesmo arquivo.
+func (c *Coordinator) SetConfigPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfgPath = path
 }
 
 // Store retorna a referência ao armazenamento SQLite gerenciado pelo coordenador.
@@ -151,6 +167,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	execCtx, cancelExec := context.WithCancel(context.WithoutCancel(ctx))
 	c.cancelExec = cancelExec
 
+	c.captureCtx = coordCtx
 	c.startTime = time.Now()
 
 	// 1. Inicia o servidor IPC em segundo plano com detecção rápida de erro
@@ -197,59 +214,25 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		if !wCfg.IsEnabled() {
 			continue
 		}
-
-		targetPath := wCfg.ResolvedPath
-		if targetPath == "" {
-			targetPath = config.ExpandPath(wCfg.Path)
-		}
-
-		w, err := watcher.New(wCfg.Name, targetPath)
-		if err != nil {
-			c.log.Error("falha ao criar watcher",
-				slog.String("watcher", wCfg.Name), slog.String("path", targetPath), slog.Any("error", err))
+		if err := c.startWatcher(coordCtx, wCfg); err != nil {
 			cancel()
-			return fmt.Errorf("falha ao criar watcher para '%s' (%s): %w", wCfg.Name, targetPath, err)
+			return err
 		}
-
-		filter, err := normalizer.NewFilter(targetPath, wCfg.Ignore)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("falha ao criar normalizador para '%s': %w", wCfg.Name, err)
-		}
-
-		deb, err := debouncer.New(wCfg.Name, wCfg.DebounceDuration, wCfg.MaxWaitDuration)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("falha ao criar debouncer para '%s': %w", wCfg.Name, err)
-		}
-
-		c.mu.Lock()
-		c.watchers[wCfg.Name] = w
-		c.filters[wCfg.Name] = filter
-		c.debouncers[wCfg.Name] = deb
-		c.mu.Unlock()
-
-		// Conecta os canais de fluxo
-		c.bindWatcherPipeline(coordCtx, wCfg, w, filter, deb)
-
-		w.Start(coordCtx)
-		deb.Start(coordCtx)
-
-		c.log.Info("watcher ativo",
-			slog.String("watcher", wCfg.Name),
-			slog.String("path", targetPath),
-			slog.Int("diretorios_vigiados", len(w.WatchedDirs())),
-			slog.Duration("debounce", wCfg.DebounceDuration),
-			slog.Duration("max_wait", wCfg.MaxWaitDuration))
 	}
 
 	// 4. Rotina periódica de manutenção
 	c.workerWg.Add(1)
 	go c.maintenanceLoop(coordCtx)
 
+	// O mapa passou a ser mutável em tempo de execução (reload), então a
+	// contagem precisa ser lida sob a trava como qualquer outro acesso.
+	c.mu.RLock()
+	activeWatchers := len(c.watchers)
+	c.mu.RUnlock()
+
 	c.log.Info("daemon pronto",
 		slog.String("versao", c.version),
-		slog.Int("watchers", len(c.watchers)),
+		slog.Int("watchers", activeWatchers),
 		slog.Int("pid", os.Getpid()))
 
 	select {
@@ -258,6 +241,88 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	case err := <-ipcErrCh:
 		return err
 	}
+}
+
+// startWatcher monta a cadeia reativa de um watcher e a inicia sob um contexto
+// próprio, derivado do de captura. Isso permite parar um watcher isoladamente
+// durante uma recarga sem afetar os demais.
+func (c *Coordinator) startWatcher(parent context.Context, wCfg config.WatcherConfig) error {
+	targetPath := wCfg.ResolvedPath
+	if targetPath == "" {
+		targetPath = config.ExpandPath(wCfg.Path)
+	}
+
+	w, err := watcher.New(wCfg.Name, targetPath)
+	if err != nil {
+		c.log.Error("falha ao criar watcher",
+			slog.String("watcher", wCfg.Name), slog.String("path", targetPath), slog.Any("error", err))
+		return fmt.Errorf("falha ao criar watcher para '%s' (%s): %w", wCfg.Name, targetPath, err)
+	}
+
+	filter, err := normalizer.NewFilter(targetPath, wCfg.Ignore)
+	if err != nil {
+		_ = w.Close()
+		return fmt.Errorf("falha ao criar normalizador para '%s': %w", wCfg.Name, err)
+	}
+
+	deb, err := debouncer.New(wCfg.Name, wCfg.DebounceDuration, wCfg.MaxWaitDuration)
+	if err != nil {
+		_ = w.Close()
+		return fmt.Errorf("falha ao criar debouncer para '%s': %w", wCfg.Name, err)
+	}
+
+	watcherCtx, cancelWatcher := context.WithCancel(parent)
+
+	c.mu.Lock()
+	c.watchers[wCfg.Name] = w
+	c.filters[wCfg.Name] = filter
+	c.debouncers[wCfg.Name] = deb
+	c.watcherCancels[wCfg.Name] = cancelWatcher
+	c.mu.Unlock()
+
+	c.bindWatcherPipeline(watcherCtx, wCfg, w, filter, deb)
+
+	w.Start(watcherCtx)
+	deb.Start(watcherCtx)
+
+	c.log.Info("watcher ativo",
+		slog.String("watcher", wCfg.Name),
+		slog.String("path", targetPath),
+		slog.Int("diretorios_vigiados", len(w.WatchedDirs())),
+		slog.Duration("debounce", wCfg.DebounceDuration),
+		slog.Duration("max_wait", wCfg.MaxWaitDuration))
+
+	return nil
+}
+
+// stopWatcher encerra um watcher específico. O debouncer descarrega o lote
+// pendente e fecha o canal de saída, de modo que a goroutine de drenagem ainda
+// persiste esse lote na fila antes de terminar — nada é perdido.
+func (c *Coordinator) stopWatcher(name string) {
+	c.mu.Lock()
+	cancelWatcher, hasCancel := c.watcherCancels[name]
+	w, hasWatcher := c.watchers[name]
+	deb, hasDeb := c.debouncers[name]
+
+	delete(c.watcherCancels, name)
+	delete(c.watchers, name)
+	delete(c.debouncers, name)
+	delete(c.filters, name)
+	c.mu.Unlock()
+
+	if hasWatcher {
+		if err := w.Close(); err != nil {
+			c.log.Warn("falha ao encerrar watcher", slog.String("watcher", name), slog.Any("error", err))
+		}
+	}
+	if hasDeb {
+		deb.Stop()
+	}
+	if hasCancel {
+		cancelWatcher()
+	}
+
+	c.log.Info("watcher encerrado", slog.String("watcher", name))
 }
 
 func (c *Coordinator) bindWatcherPipeline(
@@ -703,6 +768,155 @@ func (c *Coordinator) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 		RunningJobs: runningCount,
 		BlockedJobs: blockedCount,
 	}, nil
+}
+
+// Reload relê o arquivo de configuração e aplica a quente o que for possível.
+//
+// Watchers são adicionados, removidos e reiniciados individualmente; pipelines e
+// notificações são substituídos em memória. A seção 'daemon' (socket, diretório
+// de estado, concorrência) não pode mudar com o processo no ar — essas
+// diferenças são relatadas ao usuário em vez de aplicadas pela metade.
+func (c *Coordinator) Reload(_ context.Context) (*ipc.ReloadResponse, error) {
+	c.mu.RLock()
+	cfgPath := c.cfgPath
+	captureCtx := c.captureCtx
+	oldCfg := c.cfg
+	c.mu.RUnlock()
+
+	if cfgPath == "" {
+		return nil, fmt.Errorf("caminho da configuração desconhecido; reinicie o daemon para recarregar")
+	}
+	if captureCtx == nil {
+		return nil, fmt.Errorf("daemon ainda não iniciou a captura de eventos")
+	}
+
+	newCfg, err := config.Load(cfgPath)
+	if err != nil {
+		// Configuração inválida não substitui a que está no ar: o daemon segue
+		// funcionando com a anterior em vez de parar de sincronizar.
+		c.log.Warn("recarga recusada: configuração inválida", slog.Any("error", err))
+		return nil, fmt.Errorf("configuração inválida; nada foi alterado: %w", err)
+	}
+
+	res := &ipc.ReloadResponse{
+		Success:        true,
+		PipelinesTotal: len(newCfg.Pipelines),
+		Warnings:       config.RepoWarnings(newCfg),
+		NeedsRestart:   daemonDiff(&oldCfg.Daemon, &newCfg.Daemon),
+	}
+
+	oldWatchers := watchersByName(oldCfg)
+	newWatchers := watchersByName(newCfg)
+
+	// 1. Removidos e desabilitados
+	for name := range oldWatchers {
+		if _, kept := newWatchers[name]; !kept {
+			c.stopWatcher(name)
+			res.WatchersRemoved = append(res.WatchersRemoved, name)
+		}
+	}
+
+	// 2. Alterados: reiniciados para que caminho, ignore e janelas valham
+	for name, newW := range newWatchers {
+		oldW, existed := oldWatchers[name]
+		if !existed {
+			continue
+		}
+		if reflect.DeepEqual(oldW, newW) {
+			continue
+		}
+
+		c.stopWatcher(name)
+		if err := c.startWatcher(captureCtx, newW); err != nil {
+			c.log.Error("falha ao reiniciar watcher durante recarga",
+				slog.String("watcher", name), slog.Any("error", err))
+			res.Success = false
+			continue
+		}
+		res.WatchersUpdated = append(res.WatchersUpdated, name)
+	}
+
+	// 3. Adicionados
+	for name, newW := range newWatchers {
+		if _, existed := oldWatchers[name]; existed {
+			continue
+		}
+		if err := c.store.RegisterWatcher(&queue.WatcherRecord{
+			ID: name, Name: name, Path: newW.ResolvedPath, Status: queue.WatcherHealthy,
+		}); err != nil {
+			c.log.Error("falha ao registrar watcher novo", slog.String("watcher", name), slog.Any("error", err))
+		}
+		if err := c.startWatcher(captureCtx, newW); err != nil {
+			c.log.Error("falha ao iniciar watcher novo",
+				slog.String("watcher", name), slog.Any("error", err))
+			res.Success = false
+			continue
+		}
+		res.WatchersAdded = append(res.WatchersAdded, name)
+	}
+
+	// 4. Pipelines e notificações valem para todos os jobs seguintes
+	c.runner.UpdateConfig(newCfg)
+
+	c.mu.Lock()
+	c.cfg = newCfg
+	c.notifier = notify.New(newCfg.Notifications.NotifyOptions())
+	// Watchers que sumiram da configuração não devem deixar resíduo de pausa
+	for name := range c.paused {
+		if _, exists := newWatchers[name]; !exists {
+			delete(c.paused, name)
+		}
+	}
+	c.mu.Unlock()
+
+	sort.Strings(res.WatchersAdded)
+	sort.Strings(res.WatchersRemoved)
+	sort.Strings(res.WatchersUpdated)
+
+	res.Message = fmt.Sprintf("configuração recarregada (%d adicionado(s), %d removido(s), %d atualizado(s))",
+		len(res.WatchersAdded), len(res.WatchersRemoved), len(res.WatchersUpdated))
+
+	c.log.Info("configuração recarregada",
+		slog.Int("adicionados", len(res.WatchersAdded)),
+		slog.Int("removidos", len(res.WatchersRemoved)),
+		slog.Int("atualizados", len(res.WatchersUpdated)),
+		slog.Int("requer_reinicio", len(res.NeedsRestart)))
+
+	return res, nil
+}
+
+// watchersByName indexa apenas os watchers habilitados: desabilitar um watcher
+// na configuração equivale a removê-lo do ponto de vista da captura.
+func watchersByName(cfg *config.Config) map[string]config.WatcherConfig {
+	out := make(map[string]config.WatcherConfig, len(cfg.Watchers))
+	for _, w := range cfg.Watchers {
+		if w.IsEnabled() {
+			out[w.Name] = w
+		}
+	}
+	return out
+}
+
+// daemonDiff lista os campos da seção 'daemon' que mudaram e que só têm efeito
+// após reiniciar o processo.
+func daemonDiff(oldD, newD *config.DaemonConfig) []string {
+	var changed []string
+
+	if oldD.SocketPath != newD.SocketPath {
+		changed = append(changed, fmt.Sprintf("socket_path (%s → %s)", oldD.SocketPath, newD.SocketPath))
+	}
+	if oldD.StateDir != newD.StateDir {
+		changed = append(changed, fmt.Sprintf("state_dir (%s → %s)", oldD.StateDir, newD.StateDir))
+	}
+	if oldD.MaxConcurrentPipelines != newD.MaxConcurrentPipelines {
+		changed = append(changed, fmt.Sprintf("max_concurrent_pipelines (%d → %d)",
+			oldD.MaxConcurrentPipelines, newD.MaxConcurrentPipelines))
+	}
+	if oldD.LogLevel != newD.LogLevel {
+		changed = append(changed, fmt.Sprintf("log_level (%s → %s)", oldD.LogLevel, newD.LogLevel))
+	}
+
+	return changed
 }
 
 // Jobs responde à consulta do estado da fila persistente (CLI 'jobs' e TUI).

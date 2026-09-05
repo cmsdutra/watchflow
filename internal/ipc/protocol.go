@@ -103,6 +103,24 @@ type RunDTO struct {
 	CreatedAt    string `json:"created_at"`
 }
 
+// ReloadResponse relata o resultado de uma recarga de configuração.
+type ReloadResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+
+	WatchersAdded   []string `json:"watchers_added,omitempty"`
+	WatchersRemoved []string `json:"watchers_removed,omitempty"`
+	WatchersUpdated []string `json:"watchers_updated,omitempty"`
+	PipelinesTotal  int      `json:"pipelines_total"`
+
+	// NeedsRestart lista as mudanças que não podem ser aplicadas com o daemon
+	// no ar (a seção 'daemon'), para que o usuário saiba que precisa reiniciar.
+	NeedsRestart []string `json:"needs_restart,omitempty"`
+
+	// Warnings repassa os avisos da configuração (ex.: repositório sem remote).
+	Warnings []string `json:"warnings,omitempty"`
+}
+
 // ActionRequest parâmetros para comandos como pause e resume.
 type ActionRequest struct {
 	WatcherName string `json:"watcher_name,omitempty"`

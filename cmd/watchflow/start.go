@@ -78,6 +78,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("falha ao inicializar coordenador do daemon: %w", err)
 	}
+	// Necessário para que 'watchflow reload' saiba qual arquivo reler
+	coordinator.SetConfigPath(cfgPath)
 
 	// Configura interceptação de sinais SIGTERM e SIGINT para graceful shutdown
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

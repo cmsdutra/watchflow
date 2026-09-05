@@ -206,6 +206,8 @@ func validateWatchers(watchers []WatcherConfig, pipelines map[string]Pipeline, c
 				return fmt.Errorf("watcher '%s': referencia o pipeline inexistente '%s'", w.Name, pName)
 			}
 		}
+
+		// A checagem de repositório Git é aviso, não erro — ver RepoWarnings.
 	}
 
 	return nil

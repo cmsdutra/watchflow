@@ -59,6 +59,13 @@ func (m *cliMockHandler) Runs(_ context.Context, _ string, _ int) (*ipc.RunsResp
 	}}, nil
 }
 
+func (m *cliMockHandler) Reload(_ context.Context) (*ipc.ReloadResponse, error) {
+	return &ipc.ReloadResponse{
+		Success: true, Message: "configuração recarregada",
+		WatchersAdded: []string{"novo-vault"}, PipelinesTotal: 1,
+	}, nil
+}
+
 func (m *cliMockHandler) Sync(ctx context.Context, watcherName string) (*ipc.SyncResponse, error) {
 	return &ipc.SyncResponse{
 		EnqueuedJobs: []string{"sync-job-1"},

@@ -48,6 +48,13 @@ func (m *mockHandler) Runs(_ context.Context, watcherName string, limit int) (*i
 	}}}, nil
 }
 
+func (m *mockHandler) Reload(_ context.Context) (*ipc.ReloadResponse, error) {
+	return &ipc.ReloadResponse{
+		Success: true, Message: "configuração recarregada",
+		WatchersAdded: []string{"novo-vault"}, PipelinesTotal: 1,
+	}, nil
+}
+
 func (m *mockHandler) Sync(ctx context.Context, watcherName string) (*ipc.SyncResponse, error) {
 	if m.syncFunc != nil {
 		return m.syncFunc(ctx, watcherName)

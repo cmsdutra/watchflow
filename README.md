@@ -248,7 +248,20 @@ pastas pela linha de comando. O script de instalação cria o arquivo a partir d
 [`configs/watchflow.example.yaml`](configs/watchflow.example.yaml), que é
 inteiramente comentado; a partir daí é só ajustar.
 
-Um arquivo mínimo para sincronizar uma pasta:
+O mínimo para sincronizar uma pasta são três linhas:
+
+```yaml
+watchers:
+  - name: meu-cofre
+    path: ~/Anotacoes
+```
+
+Todo o resto tem padrão: janela de agrupamento de 15s (teto de 60s), 5
+tentativas, notificação de erro e conflito, e o pipeline de sincronização Git
+(`check_locks` → `add` → `commit` → `safe_sync` → `push`). Só declare o que
+quiser mudar.
+
+O arquivo completo, com tudo explícito:
 
 ```yaml
 version: 1
@@ -301,6 +314,28 @@ watchflow config validate
 A validação confere a sintaxe, se as pastas existem, se os nomes de ações são
 válidos e se os parâmetros de cada passo fazem sentido. Um erro de digitação é
 apontado ali, e não silenciosamente ignorado.
+
+Ela também avisa (sem reprovar) quando uma pasta vigiada não é um repositório
+Git, ou é mas não tem remoto configurado — as duas causas mais comuns de "o
+daemon está rodando e nada acontece". São avisos, e não erros, para que uma
+pasta mal configurada não impeça as outras de funcionar.
+
+### Aplicando as mudanças
+
+```bash
+watchflow reload
+```
+
+Adiciona, remove e reinicia pastas individualmente, sem derrubar o daemon nem
+interromper as que não mudaram. Se a configuração estiver inválida, nada é
+alterado e o daemon segue com a anterior.
+
+Mudanças na seção `daemon` (socket, diretório de estado, concorrência, nível de
+log) exigem reiniciar de fato — o `reload` avisa quando for o caso:
+
+```
+systemctl --user restart watchflow
+```
 
 ### Ações disponíveis nos pipelines
 
@@ -364,6 +399,7 @@ está acontecendo.
 ### Controles pontuais
 
 ```bash
+watchflow reload                  # relê a configuração sem reiniciar
 watchflow sync                    # sincroniza tudo agora, sem esperar
 watchflow sync meu-cofre          # sincroniza só uma pasta
 watchflow pause meu-cofre         # congela temporariamente

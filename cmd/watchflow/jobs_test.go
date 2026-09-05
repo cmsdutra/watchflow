@@ -119,3 +119,19 @@ func TestTruncateCellFlattensNewlines(t *testing.T) {
 		t.Errorf("quebras de linha destruiriam o alinhamento da tabela: %q", got)
 	}
 }
+
+func TestCLI_Reload(t *testing.T) {
+	sockPath := setupMockIPCServer(t)
+
+	out, err := executeCommand("reload", "--socket", sockPath)
+	if err != nil {
+		t.Fatalf("erro ao executar reload: %v (%s)", err, out)
+	}
+
+	if !strings.Contains(out, "configuração recarregada") {
+		t.Errorf("esperava a confirmação da recarga:\n%s", out)
+	}
+	if !strings.Contains(out, "+ novo-vault") {
+		t.Errorf("esperava o watcher adicionado listado:\n%s", out)
+	}
+}

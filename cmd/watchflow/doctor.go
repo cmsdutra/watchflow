@@ -61,7 +61,10 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()
 	}
-	cfg, _ := config.Load(cfgPath)
+	// Carregamento tolerante: o doctor é justamente a ferramenta que se usa
+	// quando a configuração está errada. Usar config.Load aqui faria o
+	// diagnóstico ficar cego para o problema que ele deveria apontar.
+	cfg := loadConfigLeniently(cfgPath)
 
 	var results []CheckResult
 
@@ -70,6 +73,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// 2. Binário e Versão do Git
 	results = append(results, checkGitRequirement())
+
+	// 2b. Repositórios das pastas vigiadas
+	results = append(results, checkWatchedRepos(cfg)...)
 
 	// 3. Diretório de Estado e SQLite
 	stateDir := "~/.local/state/watchflow"
@@ -166,6 +172,75 @@ func checkInotifyLimits() []CheckResult {
 	}
 
 	return res
+}
+
+// loadConfigLeniently interpreta o YAML aplicando os defaults, mas sem as
+// validações que dependem do sistema de arquivos. Devolve nil se o arquivo não
+// existir ou tiver sintaxe inválida.
+func loadConfigLeniently(path string) *config.Config {
+	data, err := os.ReadFile(config.ExpandPath(path)) // #nosec G304 -- caminho informado pelo usuário
+	if err != nil {
+		return nil
+	}
+
+	cfg, err := config.LoadBytes(data, false)
+	if err != nil {
+		return nil
+	}
+	return cfg
+}
+
+// checkWatchedRepos verifica se cada pasta vigiada é de fato um repositório Git
+// com remote. É a causa mais comum de o daemon subir e nunca sincronizar nada:
+// a condição não aparece na configuração, só no primeiro pipeline.
+func checkWatchedRepos(cfg *config.Config) []CheckResult {
+	if cfg == nil || len(cfg.Watchers) == 0 {
+		return nil
+	}
+
+	var results []CheckResult
+
+	for i := range cfg.Watchers {
+		w := &cfg.Watchers[i]
+		if !w.IsEnabled() {
+			continue
+		}
+
+		path := w.ResolvedPath
+		if path == "" {
+			path = config.ExpandPath(w.Path)
+		}
+
+		switch {
+		case !config.IsGitRepo(path):
+			results = append(results, CheckResult{
+				Category:    "Repositórios Vigiados",
+				Name:        w.Name,
+				Status:      StatusFail,
+				Message:     fmt.Sprintf("'%s' não é um repositório Git", path),
+				Remediation: fmt.Sprintf("git -C '%s' init && git -C '%s' remote add origin <url>", path, path),
+			})
+
+		case !config.HasGitRemote(path):
+			results = append(results, CheckResult{
+				Category:    "Repositórios Vigiados",
+				Name:        w.Name,
+				Status:      StatusWarn,
+				Message:     fmt.Sprintf("'%s' é um repositório Git, mas sem remote: os commits ficam só na máquina", path),
+				Remediation: fmt.Sprintf("git -C '%s' remote add origin <url>", path),
+			})
+
+		default:
+			results = append(results, CheckResult{
+				Category: "Repositórios Vigiados",
+				Name:     w.Name,
+				Status:   StatusOK,
+				Message:  fmt.Sprintf("repositório Git com remote em '%s'", path),
+			})
+		}
+	}
+
+	return results
 }
 
 func checkGitRequirement() CheckResult {

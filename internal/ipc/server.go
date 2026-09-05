@@ -21,6 +21,7 @@ type Handler interface {
 	Status(ctx context.Context) (*StatusResponse, error)
 	Jobs(ctx context.Context, watcherName string, limit int) (*JobsResponse, error)
 	Runs(ctx context.Context, watcherName string, limit int) (*RunsResponse, error)
+	Reload(ctx context.Context) (*ReloadResponse, error)
 	Sync(ctx context.Context, watcherName string) (*SyncResponse, error)
 	Pause(ctx context.Context, watcherName string) (*ActionResponse, error)
 	Resume(ctx context.Context, watcherName string) (*ActionResponse, error)
@@ -224,6 +225,15 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 			_ = json.Unmarshal(req.Params, &p)
 		}
 		res, err := s.handler.Runs(ctx, p.WatcherName, p.Limit)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			return resp
+		}
+		data, _ := json.Marshal(res)
+		resp.Result = data
+
+	case "reload":
+		res, err := s.handler.Reload(ctx)
 		if err != nil {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
 			return resp

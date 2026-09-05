@@ -52,6 +52,16 @@ var configValidateCmd = &cobra.Command{
 			cmd.Printf("    • %s (timeout: %s, steps: %d)\n", pName, p.Timeout, len(p.Steps))
 		}
 
+		// Avisos não invalidam a configuração, mas quase sempre indicam algo que
+		// o usuário não pretendia.
+		warnings := config.RepoWarnings(cfg)
+		if len(warnings) > 0 {
+			cmd.Println()
+			for _, w := range warnings {
+				cmd.Printf("  ⚠ %s\n", w)
+			}
+		}
+
 		return nil
 	},
 }

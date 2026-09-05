@@ -82,6 +82,29 @@ func (w *WatcherConfig) IsEnabled() bool {
 // declara max_retries.
 const DefaultMaxRetries = 5
 
+// DefaultPipelineName é o nome do pipeline embutido, atribuído a watchers que
+// não declaram nenhum.
+const DefaultPipelineName = "default"
+
+// DefaultPipeline devolve o pipeline de sincronização Git padrão.
+//
+// Os cinco passos, nesta ordem, são o que todo usuário escreveria de qualquer
+// forma; deixá-los implícitos reduz a configuração mínima a duas linhas por
+// pasta e tira do usuário a responsabilidade de saber que 'git.check_locks'
+// precisa vir antes de 'git.add'.
+func DefaultPipeline() Pipeline {
+	return Pipeline{
+		Timeout: "120s",
+		Steps: []Step{
+			{Action: "git.check_locks"},
+			{Action: "git.add"},
+			{Action: "git.commit"},
+			{Action: "git.safe_sync"},
+			{Action: "git.push"},
+		},
+	}
+}
+
 // Pipeline define a sequência ordenada de ações com timeout de execução.
 type Pipeline struct {
 	Timeout string `yaml:"timeout"`
@@ -183,6 +206,7 @@ func applyDefaults(cfg *Config) {
 	}
 	cfg.Notifications.Backend = strings.ToLower(cfg.Notifications.Backend)
 
+	usesDefaultPipeline := false
 	for i := range cfg.Watchers {
 		w := &cfg.Watchers[i]
 		if w.Debounce == "" {
@@ -192,6 +216,22 @@ func applyDefaults(cfg *Config) {
 			w.MaxWait = "60s"
 		}
 		w.ResolvedPath = ExpandPath(w.Path)
+
+		if len(w.Pipelines) == 0 {
+			w.Pipelines = []string{DefaultPipelineName}
+			usesDefaultPipeline = true
+		}
+	}
+
+	// Só injeta o pipeline embutido se alguém realmente depender dele, e nunca
+	// por cima de um pipeline que o usuário tenha definido com o mesmo nome.
+	if usesDefaultPipeline {
+		if cfg.Pipelines == nil {
+			cfg.Pipelines = make(map[string]Pipeline)
+		}
+		if _, declared := cfg.Pipelines[DefaultPipelineName]; !declared {
+			cfg.Pipelines[DefaultPipelineName] = DefaultPipeline()
+		}
 	}
 
 	for name, p := range cfg.Pipelines {
