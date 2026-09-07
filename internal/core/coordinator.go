@@ -94,7 +94,9 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 	}
 
 	// Registra todos os watchers configurados no SQLite
+	configured := make(map[string]struct{}, len(cfg.Watchers))
 	for _, w := range cfg.Watchers {
+		configured[w.Name] = struct{}{}
 		targetPath := w.ResolvedPath
 		if targetPath == "" {
 			targetPath = config.ExpandPath(w.Path)
@@ -107,6 +109,26 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 		}); err != nil {
 			log.Error("falha ao registrar watcher no banco de estado",
 				slog.String("watcher", w.Name), slog.String("path", targetPath), slog.Any("error", err))
+		}
+	}
+
+	// Poda watchers persistidos de execuções anteriores que saíram da
+	// configuração entre um shutdown e o start seguinte (ex.: editados à mão
+	// enquanto o daemon estava parado). Sem isso 'status' e 'jobs' continuam
+	// reportando um repositório que não é mais vigiado.
+	if existing, err := store.ListWatchers(); err != nil {
+		log.Error("falha ao listar watchers persistidos para poda", slog.Any("error", err))
+	} else {
+		for _, w := range existing {
+			if _, kept := configured[w.Name]; kept {
+				continue
+			}
+			if err := store.RemoveWatcher(w.ID); err != nil {
+				log.Error("falha ao podar watcher obsoleto do banco de estado",
+					slog.String("watcher", w.Name), slog.Any("error", err))
+				continue
+			}
+			log.Info("watcher obsoleto removido do banco de estado", slog.String("watcher", w.Name))
 		}
 	}
 
@@ -920,6 +942,10 @@ func (c *Coordinator) Reload(_ context.Context) (*ipc.ReloadResponse, error) {
 	for name := range oldWatchers {
 		if _, kept := newWatchers[name]; !kept {
 			c.stopWatcher(name)
+			if err := c.store.RemoveWatcher(name); err != nil {
+				c.log.Error("falha ao remover watcher do estado persistido",
+					slog.String("watcher", name), slog.Any("error", err))
+			}
 			res.WatchersRemoved = append(res.WatchersRemoved, name)
 		}
 	}

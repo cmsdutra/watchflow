@@ -132,6 +132,52 @@ func TestListRecentRuns(t *testing.T) {
 	}
 }
 
+// TestRemoveWatcherCascadesJobs garante que remover um watcher que saiu da
+// configuração também limpa seus jobs enfileirados (via ON DELETE CASCADE),
+// para que 'watchflow status' e 'watchflow jobs' parem de reportar um
+// repositório que não é mais vigiado.
+func TestRemoveWatcherCascadesJobs(t *testing.T) {
+	store := newStoreWithWatcher(t)
+	seedJobs(t, store)
+	if err := store.RecordPipelineRun(&queue.PipelineRun{
+		ID: "r1", JobID: "j1", WatcherID: "w", PipelineName: "p", Status: "SUCCESS",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RemoveWatcher("w"); err != nil {
+		t.Fatalf("falha ao remover watcher: %v", err)
+	}
+
+	if w, err := store.GetWatcher("w"); err != nil || w != nil {
+		t.Errorf("watcher removido ainda é encontrado por GetWatcher: %+v (err=%v)", w, err)
+	}
+
+	watchers, err := store.ListWatchers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watchers) != 0 {
+		t.Errorf("esperava nenhum watcher após remoção, obteve %d", len(watchers))
+	}
+
+	jobs, err := store.ListRecentJobs("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("jobs do watcher removido deveriam cascatear, obteve %d restantes", len(jobs))
+	}
+
+	runs, err := store.ListRecentRuns("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Errorf("execuções do watcher removido deveriam ser limpas, obteve %d restantes", len(runs))
+	}
+}
+
 func TestListRecentDefaultsLimit(t *testing.T) {
 	store := newStoreWithWatcher(t)
 

@@ -159,6 +159,32 @@ func (s *Store) RegisterWatcher(w *WatcherRecord) error {
 	return nil
 }
 
+// RemoveWatcher exclui definitivamente o registro de um watcher, seus jobs
+// enfileirados (por cascata via ON DELETE CASCADE em jobs.watcher_id) e seu
+// histórico de execuções. pipeline_runs precisa ser limpo explicitamente antes:
+// job_id ali referencia jobs(id) sem cascade, então excluir os jobs primeiro
+// deixaria referências soltas e o FOREIGN KEY constraint da própria tabela
+// watchers bloquearia a operação inteira.
+//
+// Usado quando um watcher sai da configuração (reload a quente ou reinício com
+// config editada de fora), para que 'status' e 'jobs' parem de reportar um
+// repositório que não é mais vigiado.
+func (s *Store) RemoveWatcher(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("falha ao iniciar transação para remover watcher '%s': %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`DELETE FROM pipeline_runs WHERE watcher_id = ?;`, id); err != nil {
+		return fmt.Errorf("falha ao remover histórico de execuções do watcher '%s': %w", id, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM watchers WHERE id = ?;`, id); err != nil {
+		return fmt.Errorf("falha ao remover watcher '%s': %w", id, err)
+	}
+	return tx.Commit()
+}
+
 // GetWatcher busca um watcher pelo ID.
 func (s *Store) GetWatcher(id string) (*WatcherRecord, error) {
 	query := `
