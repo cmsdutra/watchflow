@@ -43,7 +43,7 @@ pipelines:
       - action: "git.commit"
         params:
           message: "test commit"
-`, tempDir, tempDir, tempDir)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(tempDir))
 
 	cfg, err := LoadBytes([]byte(yamlData), true)
 	if err != nil {
@@ -103,7 +103,7 @@ pipelines:
   pipe:
     steps:
       - action: "noop"
-`, tempDir)
+`, yamlPath(tempDir))
 
 	cfg, err := LoadBytes([]byte(minimalYAML), true)
 	if err != nil {
@@ -158,7 +158,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "versão de configuração não suportada: 2",
 		},
 		{
@@ -173,7 +173,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "log_level 'verbose' inválido",
 		},
 		{
@@ -188,7 +188,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "backend 'telegram' inválido",
 		},
 		{
@@ -209,7 +209,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "campo 'name' é obrigatório",
 		},
 		{
@@ -225,7 +225,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir, tempDir),
+`, yamlPath(tempDir), yamlPath(tempDir)),
 			expectedErr: "watcher duplicado com o nome 'dup'",
 		},
 		{
@@ -253,7 +253,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "valor de debounce 'invalid-time' inválido",
 		},
 		{
@@ -267,7 +267,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "debounce deve ser maior que zero",
 		},
 		{
@@ -282,7 +282,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "max_wait (10s) não pode ser menor que debounce (30s)",
 		},
 		{
@@ -295,7 +295,7 @@ watchers:
 pipelines:
   p:
     steps: [{action: "a"}]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "referencia o pipeline inexistente 'pipeline-fantasma'",
 		},
 		{
@@ -305,7 +305,7 @@ watchers:
   - name: "v"
     path: "%s"
     pipelines: ["p"]
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "nenhum pipeline foi declarado",
 		},
 		{
@@ -318,7 +318,7 @@ watchers:
 pipelines:
   p:
     steps: []
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "pipeline 'p': deve conter ao menos um step",
 		},
 		{
@@ -332,7 +332,7 @@ pipelines:
   p:
     steps:
       - params: {key: "val"}
-`, tempDir),
+`, yamlPath(tempDir)),
 			expectedErr: "step 1: campo 'action' é obrigatório",
 		},
 	}
@@ -359,8 +359,12 @@ func TestExpandPath(t *testing.T) {
 		t.Errorf("esperava %s, obteve %s", filepath.Join(home, "meu-vault"), got)
 	}
 
-	if got := ExpandPath("/run/user/${UID}/watchflow.sock"); got != fmt.Sprintf("/run/user/%s/watchflow.sock", uid) {
-		t.Errorf("esperava /run/user/%s/watchflow.sock, obteve %s", uid, got)
+	// ExpandPath termina em filepath.Clean, então o separador é o da plataforma:
+	// a expectativa também passa por Clean para o teste checar a expansão de
+	// ${UID}, e não a convenção de separador do sistema de arquivos.
+	wantSock := filepath.Clean(fmt.Sprintf("/run/user/%s/watchflow.sock", uid))
+	if got := ExpandPath("/run/user/${UID}/watchflow.sock"); got != wantSock {
+		t.Errorf("esperava %s, obteve %s", wantSock, got)
 	}
 
 	if got := ExpandPath(""); got != "" {
@@ -392,7 +396,7 @@ pipelines:
   pipe:
     steps:
       - action: "git.status"
-`, tempDir)
+`, yamlPath(tempDir))
 
 	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 		t.Fatalf("falha ao gravar arquivo temporário: %v", err)
@@ -424,7 +428,7 @@ watchers:
 pipelines:
   pipe:
     steps: [{action: "test"}]
-`, tempDir)
+`, yamlPath(tempDir))
 
 	cfg, err := LoadBytes([]byte(content), false)
 	if err != nil {

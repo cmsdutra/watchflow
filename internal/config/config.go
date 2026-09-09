@@ -196,9 +196,24 @@ func applyDefaults(cfg *Config) {
 	}
 	cfg.Daemon.StateDir = ExpandPath(cfg.Daemon.StateDir)
 
+	// '/run/user/${UID}' é a convenção de runtime dir do XDG, que só existe em
+	// plataformas com UID real. No Windows os.Getuid() devolve -1, e honrar o
+	// caminho literalmente produziria '\run\user\-1\watchflow.sock' — um
+	// diretório na raiz da unidade corrente, sem relação com o usuário. Tratar
+	// como não configurado deixa o mesmo config.yaml servir nas duas
+	// plataformas, que é o modelo adotado pelo projeto.
+	hasRealUID := os.Getuid() >= 0
+	if cfg.Daemon.SocketPath != "" && !hasRealUID && strings.Contains(cfg.Daemon.SocketPath, "UID") {
+		cfg.Daemon.SocketPath = ""
+	}
+
 	if cfg.Daemon.SocketPath == "" {
+		// A checagem de UID vem antes do os.Stat de propósito. Sem ela, um
+		// diretório '\run\user\-1' criado por acidente no Windows sequestraria o
+		// socket do daemon — e é um diretório que a própria ferramenta chega a
+		// criar ao tentar preparar o caminho.
 		runUserDir := fmt.Sprintf("/run/user/%d", os.Getuid())
-		if _, err := os.Stat(runUserDir); err == nil {
+		if _, err := os.Stat(runUserDir); hasRealUID && err == nil {
 			cfg.Daemon.SocketPath = filepath.Join(runUserDir, "watchflow.sock")
 		} else {
 			cfg.Daemon.SocketPath = filepath.Join(cfg.Daemon.StateDir, "watchflow.sock")

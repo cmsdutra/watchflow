@@ -90,11 +90,22 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// 3b. Merge drivers referenciados pelos repositórios vigiados
 	results = append(results, checkMergeDrivers(cfg)...)
 
-	// 4. Unidade systemd do usuário
+	// 3c. Convenção de fim de linha dos cofres (relevante em cofres compartilhados
+	// entre Windows e Linux)
+	results = append(results, checkLineEndings(cfg)...)
+
+	// 4. Ciclo de vida do daemon: systemd no Linux, Agendador de Tarefas no
+	// Windows. Cada um reporta INFO fora da sua plataforma.
 	results = append(results, checkServiceUnit())
+	results = append(results, checkScheduledTask())
+
+	// 4b. Limite de MAX_PATH e colisões de caixa (Windows)
+	results = append(results, checkLongPaths(cfg))
+	results = append(results, checkCaseCollisions(cfg)...)
 
 	// 5. Socket IPC e Daemon
 	sockPath := resolveSocketPath()
+	results = append(results, checkSocketPathLength(sockPath))
 	results = append(results, checkIPCSocket(sockPath))
 
 	// 6. Repositórios dos Watchers configurados
@@ -707,6 +718,46 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+// maxSocketPathLen espelha o limite de sun_path validado em internal/ipc: 108
+// bytes contando o terminador nulo, no Linux e na implementação AF_UNIX do
+// Windows. O doctor checa antes porque o bind só reporta 'invalid argument'.
+const maxSocketPathLen = 108
+
+func checkSocketPathLength(sockPath string) CheckResult {
+	cleanPath := config.ExpandPath(sockPath)
+
+	if len(cleanPath) >= maxSocketPathLen {
+		return CheckResult{
+			Category: "Daemon & IPC",
+			Name:     "Socket Path Length",
+			Status:   StatusFail,
+			Message: fmt.Sprintf("caminho do socket tem %d bytes e excede o limite de %d do sistema operacional: '%s'",
+				len(cleanPath), maxSocketPathLen-1, cleanPath),
+			Remediation: "Aponte 'daemon.socket_path' para um diretório mais curto (o daemon não consegue vincular o socket neste caminho)",
+		}
+	}
+
+	// Margem estreita merece aviso: um rename do diretório de estado ou um nome
+	// de usuário mais longo passa a estourar o limite sem nenhuma outra mudança.
+	if len(cleanPath) >= maxSocketPathLen-16 {
+		return CheckResult{
+			Category: "Daemon & IPC",
+			Name:     "Socket Path Length",
+			Status:   StatusWarn,
+			Message: fmt.Sprintf("caminho do socket tem %d bytes, perto do limite de %d do sistema operacional",
+				len(cleanPath), maxSocketPathLen-1),
+			Remediation: "Considere um 'daemon.socket_path' mais curto antes que uma mudança de diretório estoure o limite",
+		}
+	}
+
+	return CheckResult{
+		Category: "Daemon & IPC",
+		Name:     "Socket Path Length",
+		Status:   StatusOK,
+		Message:  fmt.Sprintf("caminho do socket com %d bytes, dentro do limite de %d", len(cleanPath), maxSocketPathLen-1),
+	}
 }
 
 func checkIPCSocket(sockPath string) CheckResult {

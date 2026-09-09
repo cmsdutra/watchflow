@@ -128,7 +128,7 @@ func TestDesktopUrgencyForConflictIsCritical(t *testing.T) {
 		t.Errorf("esperava app-name definido: %v", gotArgs)
 	}
 
-	// AGENTS.md §3.4: argumentos como slice, nunca interpolados em shell
+	// Invariante "sem shell" (README): argumentos como slice, nunca interpolados em shell
 	for _, a := range gotArgs {
 		if strings.HasPrefix(a, "-c") || a == "sh" || a == "bash" {
 			t.Errorf("argumento suspeito de invocação por shell: %q", a)

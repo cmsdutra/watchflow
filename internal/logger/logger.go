@@ -1,5 +1,5 @@
 // Package logger fornece o logging estruturado JSON do WatchFlow, com
-// supressão central de segredos (AGENTS.md §3.5) e rotação por tamanho.
+// supressão central de segredos (ver README, "Invariantes de engenharia") e rotação por tamanho.
 package logger
 
 import (

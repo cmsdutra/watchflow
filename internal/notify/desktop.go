@@ -33,7 +33,7 @@ func (d *desktopNotifier) Notify(ctx context.Context, n Notification) error {
 		body += "\n\n" + truncate(n.Detail, 400)
 	}
 
-	// Argumentos passados como slice: nunca interpolados em shell (AGENTS.md §3.4).
+	// Argumentos passados como slice: nunca interpolados em shell (invariante "sem shell", no README).
 	args := []string{
 		"--app-name=WatchFlow",
 		"--urgency=" + urgencyFor(n.Kind),

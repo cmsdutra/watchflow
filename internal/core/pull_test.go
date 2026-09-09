@@ -32,9 +32,9 @@ func countJobsByPrefix(t *testing.T, coord *core.Coordinator, prefix string) int
 }
 
 func pullYAML(base, repo, interval string) string {
-	return "daemon:\n  state_dir: \"" + base + "/state\"\n  socket_path: \"" + base + "/wf.sock\"\n" +
+	return "daemon:\n  state_dir: \"" + yamlPath(base) + "/state\"\n  socket_path: \"" + yamlPath(base) + "/wf.sock\"\n" +
 		"notifications:\n  enabled: false\n  backend: \"log\"\n" +
-		"watchers:\n  - {name: vault, path: \"" + repo + "\", debounce: 200ms, max_wait: 500ms, pull_interval: \"" + interval + "\"}\n"
+		"watchers:\n  - {name: vault, path: \"" + yamlPath(repo) + "\", debounce: 200ms, max_wait: 500ms, pull_interval: \"" + interval + "\"}\n"
 }
 
 // TestPullLoopEnqueuesWithoutLocalChanges cobre a lacuna que motivou o recurso:

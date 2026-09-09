@@ -284,12 +284,25 @@ func runGit(ctx context.Context, repoDir string, args ...string) (string, error)
 		cleanDir = realDir
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	// GIT_TERMINAL_PROMPT=0 (abaixo) cobre o prompt de terminal, mas não um
+	// helper de credencial gráfico. No Windows o Git for Windows configura
+	// 'credential.helper=manager' no gitconfig de sistema, e o GCM pode abrir
+	// uma janela para renovar um token expirado — que ninguém vai responder,
+	// porque o daemon roda sob o Agendador de Tarefas. Um push que falha volta
+	// para a fila com backoff; um push que espera por uma janela invisível trava
+	// o watcher para sempre.
+	//
+	// Vai como argumento, e não em GIT_CONFIG_COUNT/KEY/VALUE, para não colidir
+	// com essas variáveis se já vierem do ambiente do processo.
+	fullArgs := append([]string{"-c", "credential.interactive=false"}, args...)
+
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = cleanDir
 	cmd.Env = append(cmd.Environ(),
 		"LANG=C",
 		"LC_ALL=C",
 		"GIT_TERMINAL_PROMPT=0",
+		"GCM_INTERACTIVE=never",
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -331,7 +344,7 @@ func runGit(ctx context.Context, repoDir string, args ...string) (string, error)
 
 // SanitizeGitOutput remove tokens e senhas de URLs Git em mensagens e logs.
 // Delega ao catálogo central de padrões de segredo do pacote logger, de modo que
-// a supressão exigida pelo AGENTS.md §3.5 tenha uma única fonte de verdade.
+// a supressão exigida pela invariante de supressão de segredos (README) tenha uma única fonte de verdade.
 func SanitizeGitOutput(s string) string {
 	return logger.Redact(s)
 }

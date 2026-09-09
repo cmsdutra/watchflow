@@ -33,7 +33,7 @@ pipelines:
     timeout: "30s"
     steps:
       - action: "git.add"
-`, tempDir, tempDir, vaultDir)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(vaultDir))
 
 	if err := os.WriteFile(validConfigPath, []byte(validContent), 0644); err != nil {
 		t.Fatalf("falha ao gravar valid.yaml: %v", err)
@@ -85,7 +85,7 @@ pipelines:
     timeout: "30s"
     steps:
       - action: "git.add"
-`, tempDir, tempDir, vaultDir)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(vaultDir))
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
 		t.Fatalf("falha ao gravar config.yaml: %v", err)
 	}

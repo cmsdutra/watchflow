@@ -1,5 +1,5 @@
 // Package notify entrega alertas ao usuário sobre eventos que exigem atenção,
-// em especial o conflito de merge que interrompe um watcher (AGENTS.md §3.1).
+// em especial o conflito de merge que interrompe um watcher (ver README, "Invariantes de engenharia").
 //
 // O envio é sempre best-effort: uma falha de notificação nunca interrompe nem
 // altera o resultado de um pipeline.
@@ -238,7 +238,7 @@ func (l *logNotifier) Notify(_ context.Context, n Notification) error {
 	return nil
 }
 
-// Conflict monta o alerta obrigatório de conflito de merge (AGENTS.md §3.1).
+// Conflict monta o alerta obrigatório de conflito de merge (ver README, "Invariantes de engenharia").
 func Conflict(watcher, detail string) Notification {
 	return Notification{
 		Kind:    KindConflict,

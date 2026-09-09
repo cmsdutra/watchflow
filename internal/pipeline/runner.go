@@ -165,7 +165,7 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *queue.Job) (*RunResult, er
 	// 4. Trava exclusiva da árvore de trabalho por TODA a duração do pipeline.
 	// Travar por action deixaria brechas entre steps nas quais um pipeline
 	// concorrente sobre o mesmo repositório poderia intercalar (ex.: o commit de
-	// um levaria o stage do outro), violando a garantia do AGENTS.md §3.3.
+	// um levaria o stage do outro), violando a garantia da invariante de travas (README).
 	repoLockHeld := false
 	if basePath != "" {
 		unlockRepo, lockErr := locking.DefaultRepoLocker.LockContext(execCtx, basePath)

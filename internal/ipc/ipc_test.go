@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,4 +257,34 @@ func TestIPC_UnknownMethodStillRejected(t *testing.T) {
 	if err := client.Call(context.Background(), "metodo_inexistente", nil, &out); err == nil {
 		t.Error("esperava erro para método desconhecido")
 	}
+}
+
+// TestSocketPathLengthLimit cobre o estouro de sun_path, que o bind reporta
+// apenas como 'invalid argument'. O caso é fácil de encontrar no Windows, onde
+// os caminhos temporários são longos, mas o limite de 108 bytes é o mesmo no
+// Linux — por isso o teste roda nas duas plataformas.
+func TestSocketPathLengthLimit(t *testing.T) {
+	longPath := filepath.Join(t.TempDir(), strings.Repeat("x", 120)+".sock")
+
+	t.Run("servidor recusa com mensagem acionável", func(t *testing.T) {
+		srv := ipc.NewServer(longPath, &mockHandler{})
+		err := srv.Start(context.Background())
+		if err == nil {
+			t.Fatal("esperava erro para caminho de socket acima do limite")
+		}
+		if !strings.Contains(err.Error(), "excede o limite") {
+			t.Errorf("erro não explica o limite de tamanho: %v", err)
+		}
+	})
+
+	t.Run("cliente recusa com mensagem acionável", func(t *testing.T) {
+		cli := ipc.NewClient(longPath)
+		err := cli.Call(context.Background(), "status", nil, &ipc.StatusResponse{})
+		if err == nil {
+			t.Fatal("esperava erro para caminho de socket acima do limite")
+		}
+		if !strings.Contains(err.Error(), "excede o limite") {
+			t.Errorf("erro não explica o limite de tamanho: %v", err)
+		}
+	})
 }

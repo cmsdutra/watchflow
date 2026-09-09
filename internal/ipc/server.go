@@ -16,6 +16,11 @@ import (
 	"github.com/watchflow/watchflow/internal/logger"
 )
 
+// maxSocketPathLen é o tamanho do campo sun_path de sockaddr_un, incluindo o
+// terminador nulo — 108 bytes no Linux e também na implementação AF_UNIX do
+// Windows 10 1803+. Caminhos com 108 bytes ou mais são rejeitados no bind.
+const maxSocketPathLen = 108
+
 // Handler define as operações que o daemon deve prover para responder às requisições IPC.
 type Handler interface {
 	Status(ctx context.Context) (*StatusResponse, error)
@@ -58,6 +63,18 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	cleanPath := filepath.Clean(s.socketPath)
+
+	// O endereço de um socket Unix vive no campo sun_path de sockaddr_un, de
+	// tamanho fixo — e o Windows usa a mesma estrutura de 108 bytes. Estourar o
+	// limite falha no bind com 'invalid argument', que não diz nada sobre o
+	// tamanho do caminho. Checar antes troca esse erro opaco por um acionável.
+	if len(cleanPath) >= maxSocketPathLen {
+		return fmt.Errorf(
+			"caminho do socket Unix tem %d bytes e excede o limite de %d imposto pelo sistema operacional: '%s'; "+
+				"configure 'daemon.socket_path' para um diretório mais curto",
+			len(cleanPath), maxSocketPathLen-1, cleanPath)
+	}
+
 	dir := filepath.Dir(cleanPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("falha ao criar diretório para o socket Unix '%s': %w", dir, err)

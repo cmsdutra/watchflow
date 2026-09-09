@@ -56,7 +56,7 @@ func (a *tracingAction) Execute(ctx *providers.StepContext) (*providers.StepResu
 }
 
 // TestConcurrentPipelinesOnSameRepoDoNotInterleave cobre a regressão do
-// AGENTS.md §3.3. Com a trava adquirida por action (e liberada entre steps),
+// a invariante de travas (README). Com a trava adquirida por action (e liberada entre steps),
 // dois pipelines sobre a mesma árvore Git intercalavam seus steps — cenário em
 // que o commit de um pipeline arrasta o stage do outro.
 func TestConcurrentPipelinesOnSameRepoDoNotInterleave(t *testing.T) {

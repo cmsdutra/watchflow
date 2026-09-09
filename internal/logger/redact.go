@@ -7,7 +7,7 @@ import (
 )
 
 // Padrões de segredos suprimidos antes de qualquer gravação em log ou banco,
-// conforme AGENTS.md §3.5. A lista cobre credenciais embutidas em URLs de remote
+// conforme a invariante de supressão de segredos (README). A lista cobre credenciais embutidas em URLs de remote
 // (o vetor mais comum em saídas do Git) e tokens de acesso pessoais que podem
 // aparecer em mensagens de erro, variáveis de ambiente ou cabeçalhos.
 var secretPatterns = []struct {

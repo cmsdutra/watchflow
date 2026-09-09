@@ -35,7 +35,7 @@ pipelines:
     timeout: "120s"
     steps:
       - action: "git.add"
-`, tempDir, tempDir, existingVaultPath)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(existingVaultPath))
 }
 
 func TestAddWatcherToFilePreservesCommentsAndAppends(t *testing.T) {
@@ -117,7 +117,7 @@ pipelines:
     timeout: "120s"
     steps:
       - action: "git.add"
-`, tempDir, tempDir, existingVault)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(existingVault))
 
 	cfgPath := filepath.Join(tempDir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
@@ -175,7 +175,7 @@ pipelines:
     timeout: "120s"
     steps:
       - action: "git.add"
-`, tempDir, tempDir, existingVault)
+`, yamlPath(tempDir), yamlPath(tempDir), yamlPath(existingVault))
 
 	cfgPath := filepath.Join(tempDir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {

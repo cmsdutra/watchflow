@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -99,7 +100,7 @@ func TestParseLevelRejectsInvalid(t *testing.T) {
 	}
 }
 
-// TestSecretsAreRedactedInLogs cobre a exigência do AGENTS.md §3.5: a partir do
+// TestSecretsAreRedactedInLogs cobre a invariante de supressão de segredos (README, "Invariantes de engenharia"): a partir do
 // momento em que o daemon grava logs em disco, credenciais embutidas em URLs de
 // remote e tokens de acesso não podem vazar em nenhum campo.
 func TestSecretsAreRedactedInLogs(t *testing.T) {
@@ -191,8 +192,13 @@ func TestLogRotation(t *testing.T) {
 	if info.Size() > 8192 {
 		t.Errorf("arquivo de log corrente cresceu além do limite de rotação: %d bytes", info.Size())
 	}
-	if perm := info.Mode().Perm(); perm != 0600 {
-		t.Errorf("esperava permissão 0600 no log (pode conter caminhos privados), obteve %o", perm)
+	// No Windows os bits Unix são no-op: o arquivo herda a ACL do diretório e o
+	// Go reporta 0666. A restrição de acesso ao log é, nessa plataforma, uma
+	// diferença documentada no README ("Limitações conhecidas").
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("esperava permissão 0600 no log (pode conter caminhos privados), obteve %o", perm)
+		}
 	}
 }
 

@@ -53,13 +53,13 @@ func TestStartCmd_LifecycleWithStopIPC(t *testing.T) {
 
 	cfgContent := `version: 1
 daemon:
-  state_dir: "` + stateDir + `"
-  socket_path: "` + sockPath + `"
+  state_dir: "` + yamlPath(stateDir) + `"
+  socket_path: "` + yamlPath(sockPath) + `"
   log_level: "info"
   max_concurrent_pipelines: 1
 watchers:
   - name: "start-test-vault"
-    path: "` + vaultDir + `"
+    path: "` + yamlPath(vaultDir) + `"
     debounce: "50ms"
     max_wait: "100ms"
     pipelines:

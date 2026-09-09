@@ -134,7 +134,7 @@ func runCoordinatorWithNotifications(t *testing.T, notifCfg config.NotificationC
 	return readNotifications(t, stateDir)
 }
 
-// TestConflictTriggersNotification cobre o requisito do AGENTS.md §3.1: um
+// TestConflictTriggersNotification cobre o invariante de conflito (README, "Invariantes de engenharia"): um
 // conflito de merge DEVE disparar notificação ao usuário. Antes, o pacote
 // internal/notify era um diretório vazio e o alerta simplesmente não existia.
 func TestConflictTriggersNotification(t *testing.T) {

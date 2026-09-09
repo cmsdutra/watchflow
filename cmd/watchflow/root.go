@@ -65,9 +65,12 @@ func resolveSocketPath() string {
 		return config.ExpandPath(cfg.Daemon.SocketPath)
 	}
 
+	// os.Getuid() devolve -1 no Windows, onde '/run/user/N' não é convenção
+	// nenhuma: sem esta guarda, um diretório '\run\user\-1' criado por acidente
+	// na raiz da unidade sequestraria o socket. Ver internal/config.applyDefaults.
 	uid := os.Getuid()
 	runUser := fmt.Sprintf("/run/user/%d", uid)
-	if fi, err := os.Stat(runUser); err == nil && fi.IsDir() {
+	if fi, err := os.Stat(runUser); uid >= 0 && err == nil && fi.IsDir() {
 		return filepath.Join(runUser, "watchflow.sock")
 	}
 

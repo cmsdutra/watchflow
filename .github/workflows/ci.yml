@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # A suíte cria repositórios Git de verdade; sem uma identidade global o
+  # 'git commit' dos testes falha no runner.
+  GIT_AUTHOR_NAME: WatchFlow CI
+  GIT_AUTHOR_EMAIL: ci@watchflow.local
+  GIT_COMMITTER_NAME: WatchFlow CI
+  GIT_COMMITTER_EMAIL: ci@watchflow.local
+
+jobs:
+  # Gate de compilação cruzada. É o job mais barato e o que quebra primeiro
+  # quando alguém introduz uma dependência específica de plataforma — por isso
+  # não depende dos demais nem de um runner Windows.
+  cross-build:
+    name: Compilação cruzada
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compila para Windows
+        run: GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: Compila para Linux
+        run: GOOS=linux GOARCH=amd64 go build ./...
+
+      - name: go vet nas duas plataformas
+        run: |
+          GOOS=linux go vet ./...
+          GOOS=windows go vet ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          args: --timeout=5m
+
+  # Os scripts de instalação não têm cobertura de teste, e a falha típica deles
+  # não é lógica: é de codificação. O PowerShell 5.1 — ainda o padrão do Windows
+  # — lê um .ps1 sem BOM como ANSI, e aí um travessão UTF-8 vira uma aspa
+  # tipográfica que abre uma string e quebra o parse do arquivo inteiro. Este
+  # job checa as duas coisas de uma vez.
+  powershell:
+    name: Scripts PowerShell
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exige BOM UTF-8
+        shell: powershell
+        run: |
+          $falhou = $false
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $b = [IO.File]::ReadAllBytes($_.FullName)
+            if ($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) {
+              Write-Host "::error file=$($_.FullName)::falta o BOM UTF-8; o PowerShell 5.1 lera o arquivo como ANSI"
+              $falhou = $true
+            }
+          }
+          if ($falhou) { exit 1 }
+          Write-Host "todos os .ps1 tem BOM UTF-8"
+
+      - name: Checa a sintaxe
+        shell: powershell
+        run: |
+          $falhou = $false
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $erros = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$erros)
+            foreach ($e in $erros) {
+              Write-Host "::error file=$($_.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $falhou = $true
+            }
+          }
+          if ($falhou) { exit 1 }
+          Write-Host "todos os .ps1 parseiam"
+
+  test:
+    name: Testes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A suíte compara conteúdo de arquivo byte a byte. Deixar o checkout
+          # do runner Windows converter para CRLF faria os testes medirem a
+          # configuração do Git do runner, não o comportamento do WatchFlow.
+          fetch-depth: 0
+
+      - name: Desliga a conversão de fim de linha do runner
+        run: git config --global core.autocrlf false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Testes
+        # -race exige cgo. Está disponível nos dois runners (gcc no ubuntu,
+        # mingw no windows-latest), mas não numa máquina Windows limpa — por
+        # isso o Makefile é a referência aqui, e não o inverso.
+        run: go test -race ./...
+        env:
+          CGO_ENABLED: 1

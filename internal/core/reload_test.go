@@ -63,7 +63,7 @@ func setupReloadDaemon(t *testing.T, yaml string) (*core.Coordinator, string, fu
 }
 
 func daemonYAML(base string, watchers string) string {
-	return "daemon:\n  state_dir: \"" + base + "/state\"\n  socket_path: \"" + base + "/wf.sock\"\n" +
+	return "daemon:\n  state_dir: \"" + yamlPath(base) + "/state\"\n  socket_path: \"" + yamlPath(base) + "/wf.sock\"\n" +
 		"notifications:\n  enabled: false\n  backend: \"log\"\n" +
 		"watchers:\n" + watchers
 }
@@ -89,15 +89,15 @@ func TestReloadAddsRemovesAndUpdatesWatchers(t *testing.T) {
 	repoA := fakeRepo(t, base, "A")
 	repoB := fakeRepo(t, base, "B")
 
-	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+repoA+"\", debounce: 300ms, max_wait: 1s}\n")
+	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+yamlPath(repoA)+"\", debounce: 300ms, max_wait: 1s}\n")
 
 	coord, cfgPath, cleanup := setupReloadDaemon(t, yaml)
 	defer cleanup()
 
 	// Adiciona B e muda a janela de A
 	updated := daemonYAML(base,
-		"  - {name: vault-a, path: \""+repoA+"\", debounce: 900ms, max_wait: 2s}\n"+
-			"  - {name: vault-b, path: \""+repoB+"\", debounce: 300ms, max_wait: 1s}\n")
+		"  - {name: vault-a, path: \""+yamlPath(repoA)+"\", debounce: 900ms, max_wait: 2s}\n"+
+			"  - {name: vault-b, path: \""+yamlPath(repoB)+"\", debounce: 300ms, max_wait: 1s}\n")
 	if err := os.WriteFile(cfgPath, []byte(updated), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestReloadAddsRemovesAndUpdatesWatchers(t *testing.T) {
 	}
 
 	// Remove A
-	onlyB := daemonYAML(base, "  - {name: vault-b, path: \""+repoB+"\", debounce: 300ms, max_wait: 1s}\n")
+	onlyB := daemonYAML(base, "  - {name: vault-b, path: \""+yamlPath(repoB)+"\", debounce: 300ms, max_wait: 1s}\n")
 	if err := os.WriteFile(cfgPath, []byte(onlyB), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -137,13 +137,13 @@ func TestReloadRejectsInvalidConfig(t *testing.T) {
 	base := t.TempDir()
 	repoA := fakeRepo(t, base, "A")
 
-	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+repoA+"\", debounce: 300ms, max_wait: 1s}\n")
+	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+yamlPath(repoA)+"\", debounce: 300ms, max_wait: 1s}\n")
 	coord, cfgPath, cleanup := setupReloadDaemon(t, yaml)
 	defer cleanup()
 
 	before := activeWatchers(t, coord)
 
-	broken := daemonYAML(base, "  - {name: vault-a, path: \""+repoA+"\", pipelines: [inexistente]}\n")
+	broken := daemonYAML(base, "  - {name: vault-a, path: \""+yamlPath(repoA)+"\", pipelines: [inexistente]}\n")
 	if err := os.WriteFile(cfgPath, []byte(broken), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -165,14 +165,14 @@ func TestReloadReportsDaemonChangesAsNeedingRestart(t *testing.T) {
 	base := t.TempDir()
 	repoA := fakeRepo(t, base, "A")
 
-	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+repoA+"\", debounce: 300ms, max_wait: 1s}\n")
+	yaml := daemonYAML(base, "  - {name: vault-a, path: \""+yamlPath(repoA)+"\", debounce: 300ms, max_wait: 1s}\n")
 	coord, cfgPath, cleanup := setupReloadDaemon(t, yaml)
 	defer cleanup()
 
-	changed := "daemon:\n  state_dir: \"" + base + "/state\"\n  socket_path: \"" + base + "/wf.sock\"\n" +
+	changed := "daemon:\n  state_dir: \"" + yamlPath(base) + "/state\"\n  socket_path: \"" + yamlPath(base) + "/wf.sock\"\n" +
 		"  log_level: debug\n  max_concurrent_pipelines: 8\n" +
 		"notifications:\n  enabled: false\n  backend: \"log\"\n" +
-		"watchers:\n  - {name: vault-a, path: \"" + repoA + "\", debounce: 300ms, max_wait: 1s}\n"
+		"watchers:\n  - {name: vault-a, path: \"" + yamlPath(repoA) + "\", debounce: 300ms, max_wait: 1s}\n"
 	if err := os.WriteFile(cfgPath, []byte(changed), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestReloadSurfacesRepoWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	yaml := daemonYAML(base, "  - {name: local, path: \""+repo+"\", debounce: 300ms, max_wait: 1s}\n")
+	yaml := daemonYAML(base, "  - {name: local, path: \""+yamlPath(repo)+"\", debounce: 300ms, max_wait: 1s}\n")
 	coord, _, cleanup := setupReloadDaemon(t, yaml)
 	defer cleanup()
 

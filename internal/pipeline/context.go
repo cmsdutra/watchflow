@@ -94,7 +94,7 @@ func (jc *JobContext) Duration() time.Duration {
 	return time.Since(jc.StartTime)
 }
 
-// ClassifyError analisa o erro retornado e determina sua categoria conforme AGENTS.md.
+// ClassifyError analisa o erro retornado e determina sua categoria conforme a tabela de classificação de erros do README.
 func ClassifyError(err error, res *providers.StepResult) ErrorCategory {
 	if err == nil && (res == nil || res.Success) {
 		return CategoryTransient

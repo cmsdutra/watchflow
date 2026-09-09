@@ -42,7 +42,7 @@ func (a *LockCheckerAction) Validate(params map[string]interface{}) error {
 }
 
 // maxWaitKeys aceita os dois nomes em circulação: 'max_wait_lock' é o usado no
-// AGENTS.md §3.3 e na configuração canônica distribuída, enquanto o código
+// no README ("Invariantes de engenharia") e na configuração canônica distribuída, enquanto o código
 // original só lia 'max_wait' — de modo que o valor configurado pelo usuário era
 // silenciosamente ignorado.
 var maxWaitKeys = []string{"max_wait", "max_wait_lock"}

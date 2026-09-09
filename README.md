@@ -13,7 +13,8 @@ arquivos — funciona igualmente com um editor de texto, um script ou o próprio
 gerenciador de arquivos.
 
 > **Estado do projeto:** funcional e testado, mas ainda em desenvolvimento
-> inicial. Só roda em Linux. Veja [Limitações conhecidas](#limitações-conhecidas).
+> inicial. Roda em Linux e em Windows 10 1803+. Veja
+> [Limitações conhecidas](#limitações-conhecidas).
 
 ---
 
@@ -150,8 +151,11 @@ em log ou no banco de dados.
 
 ## Requisitos
 
-- **Linux** com kernel que suporte `inotify` (qualquer distribuição moderna)
-- **Git** instalado (versão 2.30 ou mais recente é o recomendado)
+- **Linux** com kernel que suporte `inotify` (qualquer distribuição moderna),
+  ou **Windows 10 1803+** / Windows 11 — a versão mínima é a que introduziu o
+  suporte a sockets Unix, que o daemon usa para falar com a CLI
+- **Git** instalado (versão 2.30 ou mais recente é o recomendado). No Windows,
+  o [Git for Windows](https://git-scm.com/download/win)
 - Uma pasta que já seja um repositório Git com um remoto configurado
 
 Para compilar a partir do código-fonte, você também precisa do **Go 1.24+**.
@@ -197,6 +201,25 @@ Opções:
 (`./install.sh` na raiz é um atalho para `scripts/install.sh`; os dois são o
 mesmo script.)
 
+#### No Windows
+
+```powershell
+git clone https://github.com/cmsdutra/watchflow.git
+cd watchflow
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+O `install.ps1` faz o mesmo que o `install.sh`, com as mesmas garantias — é
+idempotente, nunca sobrescreve configuração existente e não pede privilégio de
+administrador em momento algum. As diferenças são as da plataforma: instala em
+`%LOCALAPPDATA%\Programs\WatchFlow`, altera só o `Path` de `HKCU` e, no lugar da
+unit do systemd, registra uma tarefa por-usuário no Agendador de Tarefas que
+sobe o daemon no logon. As flags são `-Prefix`, `-NoService`, `-NoBuild` e
+`-Yes`.
+
+A configuração fica em `~/.config/watchflow/config.yaml` nas duas plataformas,
+de propósito: o mesmo arquivo serve nas duas.
+
 O `--prefix` que você usar fica registrado no desinstalador, então não precisa
 repeti-lo na hora de remover.
 
@@ -225,15 +248,27 @@ qualquer diretório mesmo que você já tenha apagado este repositório:
 watchflow-uninstall
 ```
 
+No Windows, do mesmo jeito:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\WatchFlow\watchflow-uninstall.ps1"
+```
+
 Se ainda tiver o código-fonte, o equivalente é:
 
 ```bash
-./scripts/uninstall.sh
+./scripts/uninstall.sh                                    # Linux
+powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1   # Windows
 ```
 
-Para o serviço, remove a unit e apaga o binário. **Sua configuração e o
-histórico do daemon são preservados**, de modo que reinstalar depois devolve
-tudo como estava. Use `--purge` para removê-los também.
+Para o serviço, remove a unit (ou a tarefa do Agendador, no Windows) e apaga o
+binário. **Sua configuração e o histórico do daemon são preservados**, de modo
+que reinstalar depois devolve tudo como estava. Use `--purge` — `-Purge` no
+Windows — para removê-los também.
+
+A versão Windows também remove do seu `PATH` a entrada que o instalador
+adicionou, já que lá ela foi escrita no registro em vez de sugerida num arquivo
+de shell.
 
 As pastas que você sincronizava e os repositórios Git dentro delas nunca são
 tocados, com ou sem `--purge`.
@@ -549,6 +584,12 @@ git config --local merge.theirs.driver "cp %B %A"
 .obsidian/appearance.json merge=theirs
 ```
 
+A definição é a mesma no Windows: o Git for Windows executa merge drivers pelo
+`sh` do MSYS que acompanha a instalação, não pelo `cmd.exe`, então `cp %B %A`
+funciona sem alteração. **Não troque por `copy /Y`** — ele falha com
+`copy: command not found`, e a variante `cmd /c copy /Y` é pior: termina com
+sucesso aparente, sem marcador de conflito, mas sem adotar a versão remota.
+
 **Atenção ao detalhe que causa surpresa:** o `.gitattributes` é versionado e
 chega junto com o clone, mas a definição do driver mora no `git config --local`
 e **não viaja**. Num clone novo só a primeira metade existe, e o Git não avisa —
@@ -597,10 +638,22 @@ programa parado, o que ajuda a investigar por que ele parou.
 
 Vale saber antes de adotar:
 
-- **Só Linux.** O daemon assume `inotify`, sockets Unix e `systemd --user`. O
-  código compila para Windows sem alteração, mas não foi testado lá e há
-  comportamento que difere em silêncio — o caminho está mapeado em
-  [`docs/plano-windows.md`](docs/plano-windows.md). macOS não foi avaliado.
+- **Linux e Windows; macOS não foi avaliado.** No Windows a suíte roda verde e o
+  ciclo completo foi verificado numa máquina real (Windows 11, Git for Windows
+  2.53), mas o uso tem menos quilometragem que no Linux. Duas coisas ficaram sem
+  exercício: um push cuja credencial do Git Credential Manager esteja expirada, e
+  o cofre sincronizado com as duas máquinas ligadas ao mesmo tempo.
+- **No Windows, o caminho do socket precisa ser curto.** O endereço de um socket
+  Unix cabe em 108 bytes, e os caminhos temporários do Windows estouram isso com
+  facilidade. O `watchflow doctor` mede e avisa antes que o daemon falhe.
+- **Arquivos que diferem só em maiúsculas não coexistem no Windows.** Um cofre
+  vindo do Linux com `Nota.md` e `nota.md` traz só um dos dois para a árvore de
+  trabalho, e o outro aparece como modificado para sempre. O histórico não corre
+  risco — o Git se recusa a estagiar o caminho colidido —, e o `doctor` aponta os
+  pares. Resolver exige renomear num sistema de arquivos sensível a maiúsculas.
+- **No Windows, `make test` precisa de um compilador C.** O alvo usa `-race`, que
+  exige cgo. Sem ele, use `go test ./...` — o projeto é Go puro e a suíte roda
+  normalmente.
 - **Só Git.** A arquitetura prevê outros destinos (WebDAV, S3, rsync), mas
   apenas o Git está implementado.
 - **Sem resolução automática de conflitos**, por decisão de projeto. Quando duas
@@ -642,16 +695,61 @@ internal/
   locking/           travas de concorrência
 ```
 
+### Invariantes de engenharia
+
+As regras abaixo não são preferências de estilo: cada uma existe porque violá-la
+faz o usuário perder trabalho. Vários comentários no código apontam para esta
+seção. **Uma mudança que quebre qualquer uma delas não entra.**
+
+**Safe Git Sync, no lugar de `git pull --rebase`.** O rebase pode parar em
+*detached HEAD* esperando entrada interativa, travando o repositório num daemon
+desassistido. O fluxo obrigatório é: verificar `git status --porcelain` e pular
+o commit se não houver alteração real; commitar o que houver **antes** de
+qualquer contato com o remoto; `git fetch`; inspecionar a divergência com
+`git rev-list --left-right`; então `push` direto, `merge --ff-only` ou
+`merge --no-edit`, conforme o caso.
+
+**Conflito interrompe, nunca resolve.** Havendo conflito de linhas, executar
+`git merge --abort` imediatamente, deixar a árvore intacta, marcar o job como
+`BLOCKED`, o watcher como `CONFLICT_HALTED` e notificar o usuário. **Marcadores
+de conflito (`<<<<<<< HEAD`) jamais são escritos nos arquivos do cofre.**
+
+**Supressão de eco.** As próprias operações do daemon (`merge`, `checkout`)
+disparam eventos do sistema de arquivos. `internal/normalizer/echo_suppressor.go`
+mantém uma janela em memória (caminho + expiração de ~2s) para descartá-los.
+Sem isso o daemon reage às próprias escritas, indefinidamente.
+
+**Travas.** Uma instância por máquina, garantida pelo socket exclusivo. O daemon
+**nunca** remove um `.git/index.lock` de terceiros (Obsidian Git, VS Code): ele
+aguarda com backoff até `max_wait_lock` e, persistindo, falha como transitório
+para retentativa. Um mutex por caminho de repositório impede dois pipelines na
+mesma árvore.
+
+**Sem shell.** Nada de `sh -c`, `bash -c` ou interpolação de strings para chamar
+programas externos. Todo comando é `exec.CommandContext(ctx, "git", args...)`
+com os argumentos em `[]string`, e caminhos são resolvidos com
+`filepath.EvalSymlinks`.
+
+**Segredos nunca chegam ao log.** URLs de remote e saídas do Git passam por
+sanitização antes de ir para o log ou o banco, para suprimir tokens embutidos
+(`https://token@github.com/...`).
+
+### Classificação de erros
+
+O tratamento de falhas segue três categorias, e a diferença entre elas define se
+o WatchFlow insiste, para ou desiste:
+
+| Categoria | Causas | Ação | Estado do watcher |
+|---|---|---|---|
+| **Transitória** | Rede fora, servidor Git indisponível, `index.lock` de terceiro | Job vai para `PENDING_RETRY`, com backoff exponencial e jitter (`min(300s, 5s × 2^tentativa + rand(0,3s))`) | `HEALTHY`, log em `WARN` |
+| **Conflito** | Edição divergente do mesmo arquivo em duas máquinas | `git merge --abort` imediato, job `BLOCKED`, alerta ao usuário | `CONFLICT_HALTED`, exige intervenção |
+| **Fatal** | Caminho inexistente, permissão negada, Git ausente | Interrompe o watcher afetado | `DEGRADED`, log em `ERROR` |
+
 ### Contribuindo
 
-O arquivo [`AGENTS.md`](AGENTS.md) descreve as regras de engenharia do projeto —
-em especial as de segurança de dados, que não são negociáveis. Vale ler antes de
-propor mudanças.
-
-Pedidos práticos:
+Além das invariantes acima:
 
 - Todo comportamento novo vem com teste.
-- Nada de `sh -c` ou interpolação de strings para chamar comandos externos.
 - Se uma mudança pode fazer o usuário perder trabalho, ela não entra.
 
 ---

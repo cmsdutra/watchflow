@@ -211,6 +211,11 @@ func TestCoordinator_ProcessLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("falha ao criar coordenador 2: %v", err)
 	}
+	// NewCoordinator já abriu o state.db de coord2; como Start vai falhar na
+	// disputa do socket, é este teste que precisa devolver o handle. No Linux o
+	// vazamento passa despercebido (dá para remover arquivo aberto), no Windows
+	// ele quebra a limpeza do t.TempDir().
+	defer func() { _ = coord2.Shutdown(context.Background()) }()
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()

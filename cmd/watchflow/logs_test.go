@@ -31,8 +31,8 @@ func writeTestLog(t *testing.T, lines []string) string {
 	cfgPath := filepath.Join(dir, "config.yaml")
 	cfg := `version: 1
 daemon:
-  state_dir: "` + stateDir + `"
-  socket_path: "` + filepath.Join(dir, "wf.sock") + `"
+  state_dir: "` + yamlPath(stateDir) + `"
+  socket_path: "` + yamlPath(filepath.Join(dir, "wf.sock")) + `"
   log_level: "info"
   max_concurrent_pipelines: 1
 notifications:
@@ -40,7 +40,7 @@ notifications:
   backend: "log"
 watchers:
   - name: "vault"
-    path: "` + vault + `"
+    path: "` + yamlPath(vault) + `"
     debounce: "1s"
     max_wait: "2s"
     pipelines: ["p"]

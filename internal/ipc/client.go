@@ -43,6 +43,16 @@ func (c *Client) IsDaemonRunning() bool {
 
 // Call envia uma requisição JSON-RPC 2.0 e decodifica o resultado.
 func (c *Client) Call(ctx context.Context, method string, params interface{}, result interface{}) error {
+	// Mesmo limite de sun_path do servidor: sem esta checagem o dial devolve
+	// 'invalid argument', que manda o usuário procurar um daemon caído quando o
+	// problema é só o tamanho do caminho configurado.
+	if len(c.socketPath) >= maxSocketPathLen {
+		return fmt.Errorf(
+			"caminho do socket Unix tem %d bytes e excede o limite de %d imposto pelo sistema operacional: '%s'; "+
+				"configure 'daemon.socket_path' para um diretório mais curto",
+			len(c.socketPath), maxSocketPathLen-1, c.socketPath)
+	}
+
 	dialer := net.Dialer{Timeout: c.timeout}
 	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
