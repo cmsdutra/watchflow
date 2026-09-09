@@ -1,3 +1,9 @@
+# Procedência, para quem for depurar uma falha na estreia: este workflow foi
+# escrito e conferido numa máquina Windows, onde a suíte roda verde. Duas partes
+# dele nunca chegaram a ser executadas antes do primeiro push — o job 'lint' e a
+# metade 'ubuntu-latest' da matriz de testes —, simplesmente porque não havia
+# Linux nem golangci-lint à mão. Se algo quebrar logo de cara, é o candidato
+# mais provável, e não uma regressão do código.
 name: CI
 
 on:

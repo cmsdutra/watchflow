@@ -654,6 +654,10 @@ Vale saber antes de adotar:
 - **No Windows, `make test` precisa de um compilador C.** O alvo usa `-race`, que
   exige cgo. Sem ele, use `go test ./...` — o projeto é Go puro e a suíte roda
   normalmente.
+- **Num console legado do Windows, a saída decorada pode sair truncada.** Emoji,
+  cores e acentos são escritos em UTF-8; um console em codepage 850 os exibe
+  errado. O Windows Terminal mostra tudo corretamente, e `chcp 65001` resolve
+  num console antigo. É só aparência — nenhum comando se comporta diferente.
 - **Só Git.** A arquitetura prevê outros destinos (WebDAV, S3, rsync), mas
   apenas o Git está implementado.
 - **Sem resolução automática de conflitos**, por decisão de projeto. Quando duas
