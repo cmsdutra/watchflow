@@ -220,6 +220,12 @@ sobe o daemon no logon. As flags são `-Prefix`, `-NoService`, `-NoBuild` e
 A configuração fica em `~/.config/watchflow/config.yaml` nas duas plataformas,
 de propósito: o mesmo arquivo serve nas duas.
 
+Para iniciar o daemon à mão no Windows, use `watchflow start --detach`. Sem essa
+flag o processo fica preso ao terminal — e o `watchflow.exe` é um binário de
+console, então fechar a janela o mata. Com ela, o daemon sobe sem console
+nenhum e sobrevive ao fechamento do terminal. É o que a tarefa do Agendador usa.
+No Linux esse papel é do systemd, e a flag não existe lá.
+
 O `--prefix` que você usar fica registrado no desinstalador, então não precisa
 repeti-lo na hora de remover.
 

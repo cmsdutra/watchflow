@@ -16,7 +16,10 @@ import (
 	"github.com/watchflow/watchflow/internal/logger"
 )
 
-var foregroundFlag bool
+var (
+	foregroundFlag bool
+	detachFlag     bool
+)
 
 var startCmd = &cobra.Command{
 	Use:   "start",
@@ -28,10 +31,40 @@ var startCmd = &cobra.Command{
 func init() {
 	startCmd.Flags().BoolVarP(&foregroundFlag, "foreground", "f", false,
 		"Força o resumo legível em stdout (por padrão exibido apenas quando stdout é um terminal)")
+	startCmd.Flags().BoolVarP(&detachFlag, "detach", "d", false,
+		"Inicia o daemon em segundo plano, desligado do terminal (somente Windows)")
 	rootCmd.AddCommand(startCmd)
 }
 
+// detachChildArgs remonta a linha de comando do processo filho preservando as
+// flags que importam para ele. O '--detach' é deliberadamente omitido: com ele,
+// o filho relançaria outro filho, indefinidamente.
+func detachChildArgs() []string {
+	args := []string{"start"}
+	if cfgFile != "" {
+		args = append(args, "--config", cfgFile)
+	}
+	if socketFlag != "" {
+		args = append(args, "--socket", socketFlag)
+	}
+	if verbose {
+		args = append(args, "--verbose")
+	}
+	return args
+}
+
 func runStart(cmd *cobra.Command, args []string) error {
+	if detachFlag {
+		pid, err := spawnDetached(detachChildArgs())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("🚀 WatchFlow iniciado em segundo plano (PID: %d).\n", pid)
+		fmt.Println("Ele sobrevive ao fechamento deste terminal.")
+		fmt.Println("Acompanhe com 'watchflow status' e encerre com 'watchflow stop'.")
+		return nil
+	}
+
 	cfgPath := cfgFile
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()

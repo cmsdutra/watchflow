@@ -264,16 +264,28 @@ if (-not $NoService) {
         }
 
         if ($register) {
-            $action = New-ScheduledTaskAction -Execute $InstalledBinary -Argument 'start -f'
+            # '--detach', e não '-f': o watchflow.exe é um binário do subsistema
+            # de console, e o Agendador em sessão interativa lhe daria uma janela
+            # de console de verdade. O usuário fecha essa janela sem imaginar que
+            # ela é o daemon, e derruba a sincronização. Com --detach o processo
+            # que a tarefa inicia apenas relança o daemon sem console e sai.
+            #
+            # A sessão continua sendo a interativa (e não S4U) de propósito: é o
+            # que permite a notificação de conflito chegar à área de trabalho, e
+            # conflito é exatamente o caso que exige a atenção do usuário.
+            $action = New-ScheduledTaskAction -Execute $InstalledBinary -Argument 'start --detach'
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-            # ExecutionTimeLimit zero: é um daemon, não pode ser morto por tempo.
-            # RestartCount cobre uma queda pontual sem virar laço agressivo.
+            # ExecutionTimeLimit zero: mesmo com o lançador saindo rápido, nada
+            # aqui pode ser morto por tempo.
+            #
+            # Sem RestartCount: como a tarefa termina assim que o lançador sai,
+            # o Agendador não fica supervisionando o daemon, e uma política de
+            # reinício só dispararia se o próprio lançador falhasse. Quem protege
+            # contra instância duplicada é a trava de socket do daemon.
             $settings = New-ScheduledTaskSettingsSet `
                 -AllowStartIfOnBatteries `
                 -DontStopIfGoingOnBatteries `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                -RestartCount 3 `
-                -RestartInterval (New-TimeSpan -Minutes 1) `
                 -StartWhenAvailable
 
             try {
