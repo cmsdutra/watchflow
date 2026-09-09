@@ -14,6 +14,7 @@ import (
 
 	"github.com/watchflow/watchflow/internal/locking"
 	"github.com/watchflow/watchflow/internal/logger"
+	"github.com/watchflow/watchflow/internal/proc"
 	"github.com/watchflow/watchflow/internal/providers"
 )
 
@@ -298,6 +299,9 @@ func runGit(ctx context.Context, repoDir string, args ...string) (string, error)
 
 	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = cleanDir
+	// O daemon roda sem console no Windows; sem isto, cada git abriria um
+	// console novo e o usuário veria janelas piscando a cada sincronização.
+	proc.HideConsole(cmd)
 	cmd.Env = append(cmd.Environ(),
 		"LANG=C",
 		"LC_ALL=C",

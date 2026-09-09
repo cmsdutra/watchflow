@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/watchflow/watchflow/internal/proc"
 )
 
 // notifySendBinary é o utilitário padrão de notificação desktop no Linux.
@@ -50,6 +52,8 @@ func (d *desktopNotifier) Notify(ctx context.Context, n Notification) error {
 
 func runCommand(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// O daemon roda sem console no Windows; um notificador de console abriria um.
+	proc.HideConsole(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if msg := strings.TrimSpace(string(out)); msg != "" {

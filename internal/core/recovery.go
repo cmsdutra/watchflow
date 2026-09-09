@@ -11,6 +11,7 @@ import (
 	"github.com/watchflow/watchflow/internal/config"
 	"github.com/watchflow/watchflow/internal/locking"
 	"github.com/watchflow/watchflow/internal/logger"
+	"github.com/watchflow/watchflow/internal/proc"
 )
 
 // QueueStore define os métodos necessários da fila para o procedimento de recuperação.
@@ -131,6 +132,8 @@ func checkAndCleanDanglingGitState(ctx context.Context, repoPath, watcherName st
 		cmd := exec.CommandContext(ctx, "git", "merge", "--abort")
 		cmd.Dir = repoPath
 		cmd.Env = append(cmd.Environ(), "LANG=C", "LC_ALL=C")
+		// Sem console próprio no Windows: sem isto o Windows abriria um.
+		proc.HideConsole(cmd)
 		if out, abortErr := cmd.CombinedOutput(); abortErr != nil {
 			return false, fmt.Sprintf("watcher '%s': falha ao executar git merge --abort em repositório com MERGE_HEAD pendente: %v (%s)", watcherName, abortErr, string(out))
 		}
