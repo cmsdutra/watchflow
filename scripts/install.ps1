@@ -172,19 +172,54 @@ Write-Step 'Instalando o binário'
 New-Item -ItemType Directory -Force $Prefix | Out-Null
 $InstalledBinary = Join-Path $Prefix $BinaryName
 
-# Um daemon rodando mantém o .exe aberto, e no Windows isso impede a
-# sobrescrita — diferente do Linux, onde o install sobre um binário em uso
-# funciona. Parar o daemon antes é o que torna o script realmente idempotente.
+# Qualquer processo do watchflow mantém o .exe aberto, e o Windows recusa
+# sobrescrever um arquivo em uso — diferente do Linux, onde instalar sobre um
+# binário em execução funciona. Encerrar o daemon é o passo óbvio, mas não
+# basta: um 'watchflow tui' aberto noutra janela segura o mesmo arquivo, e a
+# cópia falha no meio da instalação.
 if (Test-Path $InstalledBinary) {
     try {
         & $InstalledBinary stop 2>&1 | Out-Null
-        Start-Sleep -Milliseconds 500
     } catch {
         # Daemon não estava rodando: seguir em frente.
     }
+
+    # Espera o encerramento gracioso em vez de dormir um tempo fixo.
+    $prazo = [Diagnostics.Stopwatch]::StartNew()
+    while ($prazo.ElapsedMilliseconds -lt 10000 -and (Get-Process -Name 'watchflow' -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Milliseconds 250
+    }
+
+    $restantes = @(Get-Process -Name 'watchflow' -ErrorAction SilentlyContinue)
+    if ($restantes.Count -gt 0) {
+        Write-Warn2 "ainda há $($restantes.Count) processo(s) 'watchflow' segurando o binário:"
+        foreach ($proc in $restantes) {
+            $linha = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
+            Write-Host "        PID $($proc.Id)  $linha"
+        }
+        if (Confirm-Step 'Encerrar esses processos para prosseguir?') {
+            $restantes | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        } else {
+            Die "instalação interrompida antes de tocar em qualquer coisa. Feche os processos acima e rode de novo."
+        }
+    }
 }
 
-Copy-Item $BuiltBinary $InstalledBinary -Force
+try {
+    Copy-Item $BuiltBinary $InstalledBinary -Force -ErrorAction Stop
+} catch {
+    # Falhar aqui deixaria o daemon parado e o binário desatualizado, que é o
+    # pior desfecho possível. Dizer exatamente isso vale mais que a exceção crua.
+    Die @"
+não foi possível substituir '$InstalledBinary': $($_.Exception.Message)
+
+  O daemon foi encerrado e o binário NÃO foi atualizado. Para voltar ao ar sem
+  atualizar, rode:
+
+    $InstalledBinary start --detach
+"@
+}
 Write-Ok $InstalledBinary
 
 # O desinstalador é autocontido: não referencia o repositório em ponto algum.
