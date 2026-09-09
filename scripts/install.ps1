@@ -52,6 +52,7 @@ $ConfigDir  = Join-Path $HOME '.config\watchflow'
 $ConfigFile = Join-Path $ConfigDir 'config.yaml'
 $StateDir   = Join-Path $HOME '.local\state\watchflow'
 $BinaryName = 'watchflow.exe'
+$LauncherName = 'watchfloww.exe'   # subsistema GUI; alvo da tarefa do Agendador
 $TaskName   = 'WatchFlow'   # precisa casar com scheduledTaskName em doctor_windows_checks.go
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,8 @@ go não encontrado no PATH.
 # 2. Compilação
 # ---------------------------------------------------------------------------
 
-$BuiltBinary = Join-Path $RepoRoot "bin\$BinaryName"
+$BuiltBinary   = Join-Path $RepoRoot "bin\$BinaryName"
+$BuiltLauncher = Join-Path $RepoRoot "bin\$LauncherName"
 
 if (-not $NoBuild) {
     Write-Step 'Compilando'
@@ -154,12 +156,23 @@ if (-not $NoBuild) {
         $env:CGO_ENABLED = '0'
         & go build -ldflags $ldflags -o $BuiltBinary ./cmd/watchflow
         if ($LASTEXITCODE -ne 0) { Die "a compilação falhou. Rode 'go build ./...' para ver o erro." }
+
+        # Segundo binário, do mesmo código, ligado ao subsistema GUI ('-H windowsgui').
+        # É o alvo da tarefa do Agendador, e existe por um motivo só: o Agendador
+        # aloca um console ao executar um binário de console numa sessão
+        # interativa. Como a tarefa repete a cada poucos minutos para
+        # supervisionar o daemon, isso apareceria como uma janela piscando na tela
+        # sem parar. Um binário GUI nunca recebe console. O sufixo 'w' é a
+        # convenção antiga do Windows — 'pythonw.exe', 'javaw.exe'.
+        & go build -ldflags "$ldflags -H windowsgui" -o $BuiltLauncher ./cmd/watchflow
+        if ($LASTEXITCODE -ne 0) { Die "a compilação do lançador falhou." }
     } finally {
         Pop-Location
     }
-    Write-Ok "binário gerado em bin\$BinaryName (v$version)"
+    Write-Ok "binários gerados em bin\ ($BinaryName + $LauncherName, v$version)"
 } else {
     if (-not (Test-Path $BuiltBinary)) { Die "-NoBuild informado, mas não há binário em bin\$BinaryName" }
+    if (-not (Test-Path $BuiltLauncher)) { Die "-NoBuild informado, mas não há lançador em bin\$LauncherName" }
     Write-Skip 'compilação pulada (-NoBuild)'
 }
 
@@ -170,7 +183,8 @@ if (-not $NoBuild) {
 Write-Step 'Instalando o binário'
 
 New-Item -ItemType Directory -Force $Prefix | Out-Null
-$InstalledBinary = Join-Path $Prefix $BinaryName
+$InstalledBinary   = Join-Path $Prefix $BinaryName
+$InstalledLauncher = Join-Path $Prefix $LauncherName
 
 # Qualquer processo do watchflow mantém o .exe aberto, e o Windows recusa
 # sobrescrever um arquivo em uso — diferente do Linux, onde instalar sobre um
@@ -208,6 +222,7 @@ if (Test-Path $InstalledBinary) {
 
 try {
     Copy-Item $BuiltBinary $InstalledBinary -Force -ErrorAction Stop
+    Copy-Item $BuiltLauncher $InstalledLauncher -Force -ErrorAction Stop
 } catch {
     # Falhar aqui deixaria o daemon parado e o binário desatualizado, que é o
     # pior desfecho possível. Dizer exatamente isso vale mais que a exceção crua.
@@ -221,6 +236,7 @@ não foi possível substituir '$InstalledBinary': $($_.Exception.Message)
 "@
 }
 Write-Ok $InstalledBinary
+Write-Ok "$InstalledLauncher (lançador sem console, usado pela tarefa)"
 
 # O desinstalador é autocontido: não referencia o repositório em ponto algum.
 # Instalá-lo junto do binário resolve o caso de o usuário apagar o clone depois.
@@ -308,7 +324,7 @@ if (-not $NoService) {
             # A sessão continua sendo a interativa (e não S4U) de propósito: é o
             # que permite a notificação de conflito chegar à área de trabalho, e
             # conflito é exatamente o caso que exige a atenção do usuário.
-            $action = New-ScheduledTaskAction -Execute $InstalledBinary -Argument 'start --detach'
+            $action = New-ScheduledTaskAction -Execute $InstalledLauncher -Argument 'start --detach'
 
             # Dois gatilhos, com papéis distintos.
             #

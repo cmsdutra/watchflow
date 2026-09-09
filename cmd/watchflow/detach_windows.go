@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -23,8 +25,40 @@ const (
 	createNoWindow = 0x08000000
 )
 
-// spawnDetached relança este mesmo binário em segundo plano, sem console e sem
-// vínculo com o terminal que o chamou.
+// daemonBinaryFor traduz o caminho do lançador no caminho do daemon.
+//
+// A distribuição no Windows tem dois executáveis a partir do mesmo código:
+// 'watchflow.exe', de subsistema de console, que é a CLI; e 'watchfloww.exe',
+// de subsistema GUI, cujo único papel é ser o alvo da tarefa do Agendador. O
+// sufixo 'w' segue a convenção antiga do Windows — 'pythonw.exe', 'javaw.exe'.
+//
+// A razão é que o Agendador, ao executar um binário de console numa sessão
+// interativa, aloca um console para ele. Como a ação da tarefa repete a cada
+// poucos minutos para supervisionar o daemon, isso vira uma janela piscando na
+// tela do usuário sem parar. Um binário GUI nunca recebe console.
+//
+// O daemon em si continua sendo o de console: ele é iniciado com CREATE_NO_WINDOW
+// e portanto também não abre janela, e mantém stdout/stderr válidos — o que o
+// GUI não tem, e de que o subsistema de log precisa.
+func daemonBinaryFor(launcher string) string {
+	dir := filepath.Dir(launcher)
+	name := filepath.Base(launcher)
+
+	if strings.HasSuffix(strings.ToLower(name), "w.exe") {
+		name = name[:len(name)-len("w.exe")] + ".exe"
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Sem par de console instalado ao lado, relançar a si mesmo continua sendo
+	// melhor do que falhar: o daemon roda, apenas sem stdout/stderr.
+	return launcher
+}
+
+// spawnDetached relança o daemon em segundo plano, sem console e sem vínculo
+// com o terminal que o chamou.
 //
 // O Windows não tem equivalente ao fork/setsid do Unix, e um app de console
 // iniciado pelo Agendador de Tarefas em sessão interativa ganha uma janela de
@@ -36,6 +70,7 @@ func spawnDetached(args []string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("não foi possível determinar o caminho do próprio binário: %w", err)
 	}
+	exePath = daemonBinaryFor(exePath)
 
 	cmd := exec.Command(exePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{

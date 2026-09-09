@@ -106,6 +106,18 @@ if ($avulso) {
 
 Write-Step 'Removendo o binário'
 
+# O lançador sem console (watchfloww.exe), instalado ao lado do binário para ser
+# o alvo da tarefa do Agendador. Sai junto, senão fica um órfão no prefixo.
+$InstalledLauncher = Join-Path $Prefix 'watchfloww.exe'
+if (Test-Path $InstalledLauncher) {
+    try {
+        Remove-Item $InstalledLauncher -Force
+        Write-Ok $InstalledLauncher
+    } catch {
+        Write-Warn2 "não foi possível remover '$InstalledLauncher': $($_.Exception.Message)"
+    }
+}
+
 if (Test-Path $InstalledBinary) {
     try {
         Remove-Item $InstalledBinary -Force

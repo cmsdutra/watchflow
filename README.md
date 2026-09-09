@@ -222,6 +222,13 @@ cair, ele volta na próxima passagem. Passar com o daemon de pé não custa nada
 `start --detach` consulta o socket antes e sai sem criar processo nem escrever
 no log.
 
+A instalação coloca dois executáveis no prefixo. O `watchflow.exe` é a CLI que
+você usa. O `watchfloww.exe` é o mesmo programa ligado ao subsistema GUI, e
+existe por um motivo só: o Agendador aloca um console ao executar um binário de
+console, e a tarefa que repete a cada 5 minutos apareceria como uma janela
+piscando na tela sem parar. Um binário GUI nunca recebe console. O sufixo `w`
+segue a convenção de `pythonw.exe` e `javaw.exe`.
+
 O daemon roda na sua sessão, então não sincroniza enquanto você está deslogado.
 É o preço de manter a tarefa interativa, que é o que permite a notificação
 alcançar a área de trabalho.
