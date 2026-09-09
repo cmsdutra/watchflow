@@ -660,6 +660,13 @@ Vale saber antes de adotar:
 - **No Windows, `make test` precisa de um compilador C.** O alvo usa `-race`, que
   exige cgo. Sem ele, use `go test ./...` — o projeto é Go puro e a suíte roda
   normalmente.
+- **No Windows não há notificação na área de trabalho.** O backend `desktop` usa
+  `notify-send`, que é do Linux; lá o daemon degrada para alertas somente em log
+  e avisa. Na prática isso significa que **um conflito de merge não te procura**:
+  o watcher entra em `CONFLICT_HALTED` e para de sincronizar em silêncio.
+  Enquanto não houver toast nativo
+  ([issue 001](docs/issues/001-notificador-desktop-windows.md)), verifique com
+  `watchflow status` de tempos em tempos.
 - **Num console legado do Windows, a saída decorada pode sair truncada.** Emoji,
   cores e acentos são escritos em UTF-8; um console em codepage 850 os exibe
   errado. O Windows Terminal mostra tudo corretamente, e `chcp 65001` resolve
