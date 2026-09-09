@@ -213,9 +213,18 @@ O `install.ps1` faz o mesmo que o `install.sh`, com as mesmas garantias — é
 idempotente, nunca sobrescreve configuração existente e não pede privilégio de
 administrador em momento algum. As diferenças são as da plataforma: instala em
 `%LOCALAPPDATA%\Programs\WatchFlow`, altera só o `Path` de `HKCU` e, no lugar da
-unit do systemd, registra uma tarefa por-usuário no Agendador de Tarefas que
-sobe o daemon no logon. As flags são `-Prefix`, `-NoService`, `-NoBuild` e
-`-Yes`.
+unit do systemd, registra uma tarefa por-usuário no Agendador de Tarefas. As
+flags são `-Prefix`, `-NoService`, `-NoBuild` e `-Yes`.
+
+A tarefa tem dois gatilhos: um no logon, que sobe o daemon quando você entra na
+máquina, e um a cada 5 minutos, que faz o papel de supervisão — se o daemon
+cair, ele volta na próxima passagem. Passar com o daemon de pé não custa nada:
+`start --detach` consulta o socket antes e sai sem criar processo nem escrever
+no log.
+
+O daemon roda na sua sessão, então não sincroniza enquanto você está deslogado.
+É o preço de manter a tarefa interativa, que é o que permite a notificação
+alcançar a área de trabalho.
 
 A configuração fica em `~/.config/watchflow/config.yaml` nas duas plataformas,
 de propósito: o mesmo arquivo serve nas duas.

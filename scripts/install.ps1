@@ -309,7 +309,27 @@ if (-not $NoService) {
             # que permite a notificação de conflito chegar à área de trabalho, e
             # conflito é exatamente o caso que exige a atenção do usuário.
             $action = New-ScheduledTaskAction -Execute $InstalledBinary -Argument 'start --detach'
-            $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+
+            # Dois gatilhos, com papéis distintos.
+            #
+            # O de logon sobe o daemon quando você entra na máquina.
+            $trigLogon = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+
+            # O periódico é a supervisão. Como a tarefa termina assim que o
+            # lançador sai, o Agendador não fica vigiando o processo — se o
+            # daemon cair no meio da sessão, nada o levantaria. Este gatilho
+            # devolve essa garantia, que no Linux é do systemd.
+            #
+            # Passar com o daemon de pé é barato e silencioso: 'start --detach'
+            # consulta o socket antes e sai sem criar processo nem escrever no
+            # log. A janela máxima sem sincronização, numa queda, é o intervalo
+            # abaixo.
+            # -RepetitionDuration é omitido de propósito: sem ele a repetição é
+            # indefinida, que é o desejado. Passar [TimeSpan]::MaxValue ou Zero
+            # faz o Agendador rejeitar o XML ("valor formatado incorretamente ou
+            # fora do intervalo") — verificado nas três variantes.
+            $trigSupervisao = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Minutes 5)
             # ExecutionTimeLimit zero: mesmo com o lançador saindo rápido, nada
             # aqui pode ser morto por tempo.
             #
@@ -325,7 +345,7 @@ if (-not $NoService) {
 
             try {
                 Register-ScheduledTask -TaskName $TaskName `
-                    -Action $action -Trigger $trigger -Settings $settings `
+                    -Action $action -Trigger @($trigLogon, $trigSupervisao) -Settings $settings `
                     -Description 'WatchFlow — sincronização autônoma de cofres via Git' `
                     -Force | Out-Null
 

@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/watchflow/watchflow/internal/config"
 	"github.com/watchflow/watchflow/internal/core"
+	"github.com/watchflow/watchflow/internal/ipc"
 	"github.com/watchflow/watchflow/internal/logger"
 )
 
@@ -55,6 +56,16 @@ func detachChildArgs() []string {
 
 func runStart(cmd *cobra.Command, args []string) error {
 	if detachFlag {
+		// Idempotência é o contrato de '--detach': quem o chama é um supervisor
+		// (a tarefa do Agendador, que roda de tempos em tempos para levantar o
+		// daemon caso ele tenha caído). Sem esta checagem, cada passagem com o
+		// daemon de pé criaria um processo que morre na trava de socket e deixa
+		// um ERROR no log — transformando a supervisão em ruído periódico.
+		if ipc.NewClient(resolveSocketPath()).IsDaemonRunning() {
+			fmt.Println("WatchFlow já está em execução; nada a fazer.")
+			return nil
+		}
+
 		pid, err := spawnDetached(detachChildArgs())
 		if err != nil {
 			return err
