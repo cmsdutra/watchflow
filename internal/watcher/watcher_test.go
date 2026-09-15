@@ -171,6 +171,163 @@ func TestWatcherDynamicSubdirectoryCreation(t *testing.T) {
 	}
 }
 
+// forceSuspendSupport habilita o caminho de suspensão fora do Windows, para que
+// o comportamento seja exercitado em qualquer plataforma de CI.
+func forceSuspendSupport(t *testing.T) {
+	t.Helper()
+	original := releaseHandlesOnSuspend
+	releaseHandlesOnSuspend = true
+	t.Cleanup(func() { releaseHandlesOnSuspend = original })
+}
+
+func TestWatcherSuspendReleasesWatches(t *testing.T) {
+	forceSuspendSupport(t)
+
+	tempDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tempDir, "sub"), 0755); err != nil {
+		t.Fatalf("falha ao criar sub: %v", err)
+	}
+
+	w, err := New("suspend-test", tempDir)
+	if err != nil {
+		t.Fatalf("falha ao criar watcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if got := len(w.WatchedDirs()); got != 2 {
+		t.Fatalf("esperava 2 diretórios vigiados antes da suspensão, obteve %d", got)
+	}
+
+	w.Suspend()
+	if got := w.WatchedDirs(); len(got) != 0 {
+		t.Errorf("esperava nenhum diretório vigiado após Suspend, obteve %v", got)
+	}
+
+	// Suspender de novo não deve quebrar nem reabrir handles.
+	w.Suspend()
+	if got := len(w.WatchedDirs()); got != 0 {
+		t.Errorf("Suspend repetido deveria ser inócuo, obteve %d diretórios", got)
+	}
+}
+
+func TestWatcherResumeRewalksReorganizedTree(t *testing.T) {
+	forceSuspendSupport(t)
+
+	tempDir := t.TempDir()
+	origem := filepath.Join(tempDir, "inbox", "projeto")
+	if err := os.MkdirAll(origem, 0755); err != nil {
+		t.Fatalf("falha ao criar árvore inicial: %v", err)
+	}
+
+	w, err := New("resume-test", tempDir)
+	if err != nil {
+		t.Fatalf("falha ao criar watcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	w.Suspend()
+
+	// Com os handles devolvidos, a pasta vigiada pode ser movida — o cenário da
+	// issue #3, que no Windows falhava com violação de compartilhamento.
+	destinoPai := filepath.Join(tempDir, "tasks")
+	if err := os.MkdirAll(destinoPai, 0755); err != nil {
+		t.Fatalf("falha ao criar pasta destino: %v", err)
+	}
+	destino := filepath.Join(destinoPai, "projeto")
+	if err := os.Rename(origem, destino); err != nil {
+		t.Fatalf("falha ao mover pasta vigiada com watcher suspenso: %v", err)
+	}
+
+	resumed, err := w.Resume()
+	if err != nil {
+		t.Fatalf("falha ao retomar watcher: %v", err)
+	}
+	if !resumed {
+		t.Fatal("Resume deveria informar que havia suspensão a desfazer")
+	}
+
+	// A varredura precisa refletir a nova hierarquia, não a antiga.
+	dirs := w.WatchedDirs()
+	for _, dir := range dirs {
+		if dir == origem {
+			t.Errorf("caminho antigo %s ainda consta como vigiado: %v", origem, dirs)
+		}
+	}
+	if !w.tree.Has(destino) {
+		t.Errorf("esperava o novo caminho %s vigiado, obteve %v", destino, dirs)
+	}
+
+	// E o monitoramento precisa estar de fato vivo no destino.
+	arquivo := filepath.Join(destino, "nota.md")
+	if err := os.WriteFile(arquivo, []byte("conteudo"), 0644); err != nil {
+		t.Fatalf("falha ao escrever arquivo: %v", err)
+	}
+
+	// Eventos capturados pelo kernel antes da suspensão ainda podem estar em
+	// trânsito, então o que importa é o evento do destino chegar, não ser o
+	// primeiro da fila.
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-w.Events():
+			if ev.Path == arquivo {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("timeout aguardando evento em %s após retomada", arquivo)
+		}
+	}
+}
+
+func TestWatcherResumeWithoutSuspendIsNoop(t *testing.T) {
+	forceSuspendSupport(t)
+
+	tempDir := t.TempDir()
+	w, err := New("resume-noop-test", tempDir)
+	if err != nil {
+		t.Fatalf("falha ao criar watcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	resumed, err := w.Resume()
+	if err != nil {
+		t.Fatalf("Resume sem suspensão retornou erro: %v", err)
+	}
+	if resumed {
+		t.Error("Resume sem suspensão prévia não deveria reportar retomada")
+	}
+}
+
+func TestWatcherSuspendIsNoopOffWindows(t *testing.T) {
+	original := releaseHandlesOnSuspend
+	releaseHandlesOnSuspend = false
+	t.Cleanup(func() { releaseHandlesOnSuspend = original })
+
+	tempDir := t.TempDir()
+	w, err := New("suspend-noop-test", tempDir)
+	if err != nil {
+		t.Fatalf("falha ao criar watcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	w.Suspend()
+	if got := len(w.WatchedDirs()); got != 1 {
+		t.Errorf("fora do Windows a suspensão deve ser inócua, obteve %d diretórios", got)
+	}
+
+	resumed, err := w.Resume()
+	if err != nil {
+		t.Fatalf("Resume retornou erro: %v", err)
+	}
+	if resumed {
+		t.Error("fora do Windows Resume não deveria reportar retomada")
+	}
+}
+
 func TestWatcherContextCancellation(t *testing.T) {
 	tempDir := t.TempDir()
 

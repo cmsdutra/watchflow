@@ -15,6 +15,7 @@ import (
 type DirectoryTree struct {
 	mu        sync.RWMutex
 	dirs      map[string]bool
+	suspended bool
 	fsWatcher *fsnotify.Watcher
 }
 
@@ -32,6 +33,11 @@ func (dt *DirectoryTree) AddDir(path string) error {
 
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
+
+	// Um evento em voo não pode reabrir um handle que Suspend acabou de devolver.
+	if dt.suspended {
+		return nil
+	}
 
 	if dt.dirs[cleanPath] {
 		return nil
@@ -61,6 +67,29 @@ func (dt *DirectoryTree) RemoveDir(path string) error {
 	// ignoramos erro caso o watcher já tenha sido descartado pelo kernel.
 	_ = dt.fsWatcher.Remove(cleanPath)
 	return nil
+}
+
+// Suspend devolve ao sistema todos os handles de monitoramento e esvazia o mapa
+// interno, deixando a árvore inerte até Resume. Novas adições viram no-op
+// enquanto suspensa.
+func (dt *DirectoryTree) Suspend() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	dt.suspended = true
+	for dir := range dt.dirs {
+		_ = dt.fsWatcher.Remove(dir)
+		delete(dt.dirs, dir)
+	}
+}
+
+// Resume reabilita o registro de diretórios. A árvore volta vazia: cabe ao
+// chamador refazer a varredura, já que a hierarquia pode ter mudado durante a
+// suspensão.
+func (dt *DirectoryTree) Resume() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.suspended = false
 }
 
 // WalkAndAdd percorre recursivamente a partir de root e adiciona todas as subpastas encontradas.

@@ -308,6 +308,11 @@ func (c *Coordinator) startWatcher(parent context.Context, wCfg config.WatcherCo
 	c.filters[wCfg.Name] = filter
 	c.debouncers[wCfg.Name] = deb
 	c.watcherCancels[wCfg.Name] = cancelWatcher
+	// Uma recarga de configuração recria o watcher; sem isto ele reabriria os
+	// handles de um watcher pausado, voltando a travar rename/move das pastas.
+	if c.paused[wCfg.Name] {
+		w.Suspend()
+	}
 	c.mu.Unlock()
 
 	c.bindWatcherPipeline(watcherCtx, wCfg, w, filter, deb)
@@ -707,6 +712,54 @@ func (c *Coordinator) hasWatcher(name string) bool {
 		}
 	}
 	return false
+}
+
+// watcherConfig devolve a configuração do watcher pelo nome.
+func (c *Coordinator) watcherConfig(name string) (config.WatcherConfig, bool) {
+	for _, w := range c.cfg.Watchers {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return config.WatcherConfig{}, false
+}
+
+// suspendWatcher devolve ao sistema os handles de monitoramento do watcher, para
+// que pastas vigiadas possam ser movidas ou renomeadas com o daemon no ar.
+// Requer c.mu travado.
+func (c *Coordinator) suspendWatcher(name string) {
+	if w, ok := c.watchers[name]; ok {
+		w.Suspend()
+	}
+}
+
+// resumeWatcher reativa o monitoramento e, quando havia suspensão a desfazer,
+// enfileira uma ressincronização: o que mudou enquanto os handles estavam
+// liberados não gerou evento e ficaria parado até a próxima alteração.
+// Requer c.mu travado.
+func (c *Coordinator) resumeWatcher(name string) {
+	w, ok := c.watchers[name]
+	if !ok {
+		return
+	}
+
+	resumed, err := w.Resume()
+	if err != nil {
+		c.log.Warn("falha ao reabilitar monitoramento do watcher",
+			slog.String("watcher", name), slog.Any("error", err))
+	}
+	if !resumed {
+		return
+	}
+
+	wCfg, ok := c.watcherConfig(name)
+	if !ok || !wCfg.IsEnabled() {
+		return
+	}
+	if jobs := c.enqueueFullSync(wCfg); len(jobs) > 0 {
+		c.log.Info("ressincronização enfileirada após retomada",
+			slog.String("watcher", name), slog.Int("jobs", len(jobs)))
+	}
 }
 
 // isConflictHalted informa se o watcher está interrompido por conflito de merge
@@ -1165,22 +1218,7 @@ func (c *Coordinator) Sync(ctx context.Context, watcherName string) (*ipc.SyncRe
 			continue
 		}
 
-		for _, pipeName := range wCfg.Pipelines {
-			jobID := fmt.Sprintf("manual_%d_%s", time.Now().UnixNano(), wCfg.Name)
-			job := &queue.Job{
-				ID:           jobID,
-				WatcherID:    wCfg.Name,
-				PipelineName: pipeName,
-				PayloadFiles: []string{},
-				MaxRetries:   c.retryLimitFor(pipeName),
-			}
-			if err := c.store.EnqueueJob(job); err != nil {
-				c.log.Error("falha ao enfileirar job de sincronização manual",
-					slog.String("job_id", jobID), slog.String("watcher", wCfg.Name), slog.Any("error", err))
-				continue
-			}
-			enqueued = append(enqueued, jobID)
-		}
+		enqueued = append(enqueued, c.enqueueFullSync(wCfg)...)
 	}
 
 	c.log.Info("sincronização manual solicitada",
@@ -1200,6 +1238,33 @@ func (c *Coordinator) Sync(ctx context.Context, watcherName string) (*ipc.SyncRe
 	}, nil
 }
 
+// enqueueFullSync gera um job por pipeline do watcher com payload vazio. Sem
+// lote de arquivos, o passo de stage varre a árvore inteira — o que serve tanto
+// ao 'sync' manual quanto à recuperação do que mudou com o watcher suspenso.
+// Requer c.mu travado.
+func (c *Coordinator) enqueueFullSync(wCfg config.WatcherConfig) []string {
+	var enqueued []string
+
+	for _, pipeName := range wCfg.Pipelines {
+		jobID := fmt.Sprintf("manual_%d_%s", time.Now().UnixNano(), wCfg.Name)
+		job := &queue.Job{
+			ID:           jobID,
+			WatcherID:    wCfg.Name,
+			PipelineName: pipeName,
+			PayloadFiles: []string{},
+			MaxRetries:   c.retryLimitFor(pipeName),
+		}
+		if err := c.store.EnqueueJob(job); err != nil {
+			c.log.Error("falha ao enfileirar job de sincronização",
+				slog.String("job_id", jobID), slog.String("watcher", wCfg.Name), slog.Any("error", err))
+			continue
+		}
+		enqueued = append(enqueued, jobID)
+	}
+
+	return enqueued
+}
+
 // Pause responde à solicitação do comando 'watchflow pause'.
 func (c *Coordinator) Pause(ctx context.Context, watcherName string) (*ipc.ActionResponse, error) {
 	c.mu.Lock()
@@ -1210,6 +1275,7 @@ func (c *Coordinator) Pause(ctx context.Context, watcherName string) (*ipc.Actio
 		if err := c.store.UpdateWatcherStatus(watcherName, queue.WatcherPaused, ""); err != nil {
 			c.log.Warn("falha ao persistir status PAUSED", slog.String("watcher", watcherName), slog.Any("error", err))
 		}
+		c.suspendWatcher(watcherName)
 		c.log.Info("watcher pausado", slog.String("watcher", watcherName))
 		return &ipc.ActionResponse{
 			Success: true,
@@ -1222,6 +1288,7 @@ func (c *Coordinator) Pause(ctx context.Context, watcherName string) (*ipc.Actio
 		if err := c.store.UpdateWatcherStatus(w.Name, queue.WatcherPaused, ""); err != nil {
 			c.log.Warn("falha ao persistir status PAUSED", slog.String("watcher", w.Name), slog.Any("error", err))
 		}
+		c.suspendWatcher(w.Name)
 	}
 	c.log.Info("todos os watchers pausados", slog.Int("quantidade", len(c.cfg.Watchers)))
 
@@ -1246,6 +1313,7 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 		if r, ok := c.notifier.(notify.Resetter); ok {
 			r.Reset(watcherName)
 		}
+		c.resumeWatcher(watcherName)
 		c.log.Info("watcher retomado", slog.String("watcher", watcherName))
 		return &ipc.ActionResponse{
 			Success: true,
@@ -1263,6 +1331,9 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 		for _, w := range c.cfg.Watchers {
 			r.Reset(w.Name)
 		}
+	}
+	for _, w := range c.cfg.Watchers {
+		c.resumeWatcher(w.Name)
 	}
 	c.log.Info("todos os watchers retomados", slog.Int("quantidade", len(c.cfg.Watchers)))
 

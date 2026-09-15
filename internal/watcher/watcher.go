@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -51,7 +52,17 @@ type Watcher struct {
 	done      chan struct{}
 	log       *slog.Logger
 	closeOnce sync.Once
+
+	mu        sync.Mutex
+	suspended bool
 }
+
+// releaseHandlesOnSuspend indica se a plataforma precisa devolver os handles de
+// monitoramento ao pausar. Só o Windows precisa: o ReadDirectoryChangesW mantém
+// um handle aberto por diretório vigiado, e ele faz rename/move da pasta falhar
+// com violação de compartilhamento. inotify e FSEvents não prendem o diretório,
+// então lá a suspensão só criaria um ponto cego sem contrapartida.
+var releaseHandlesOnSuspend = runtime.GOOS == "windows"
 
 // New instancia um novo Watcher recursivo para o diretório raiz indicado.
 func New(name, rootPath string) (*Watcher, error) {
@@ -253,6 +264,54 @@ func (w *Watcher) RootPath() string {
 // Name retorna o identificador único do watcher.
 func (w *Watcher) Name() string {
 	return w.name
+}
+
+// Suspend libera os handles de monitoramento sem encerrar o watcher, permitindo
+// mover ou renomear pastas vigiadas com o daemon no ar. Fora do Windows é no-op:
+// ver releaseHandlesOnSuspend. Eventos ocorridos durante a suspensão não são
+// capturados, então o chamador deve provocar uma ressincronização ao retomar.
+func (w *Watcher) Suspend() {
+	if !releaseHandlesOnSuspend {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.suspended {
+		return
+	}
+	w.suspended = true
+	w.tree.Suspend()
+	w.log.Info("monitoramento suspenso; handles de diretório liberados")
+}
+
+// Resume volta a vigiar a árvore. A varredura é refeita do zero porque a
+// hierarquia pode ter sido reorganizada durante a suspensão — que é justamente
+// o motivo de suspender. O booleano informa se havia de fato uma suspensão a
+// desfazer, permitindo ao chamador ressincronizar só quando necessário; vem
+// verdadeiro mesmo com erro de varredura, pois o watcher já saiu do estado
+// suspenso.
+func (w *Watcher) Resume() (bool, error) {
+	if !releaseHandlesOnSuspend {
+		return false, nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.suspended {
+		return false, nil
+	}
+	w.suspended = false
+	w.tree.Resume()
+
+	if err := w.tree.WalkAndAdd(w.rootPath); err != nil {
+		return true, fmt.Errorf("falha ao reabilitar monitoramento em '%s': %w", w.rootPath, err)
+	}
+
+	w.log.Info("monitoramento retomado", slog.Int("diretorios", w.tree.Count()))
+	return true, nil
 }
 
 // Close encerra a escuta do fsnotify e libera descritores de sistema de forma idempotente.
