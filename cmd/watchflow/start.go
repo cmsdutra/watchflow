@@ -144,30 +144,73 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Log JSON: %s\n", filepath.Join(stateDir, logger.LogFileName))
 	}
 
+	// Um Start que falhou também passa pelo Shutdown: workers e socket já
+	// estão de pé, e sair sem fechá-los deixaria jobs em RUNNING.
+	var runErr error
 	select {
 	case <-ctx.Done():
 		if foregroundFlag || isTerminal(os.Stdout) {
 			fmt.Println("\n🛑 Sinal de encerramento recebido (SIGINT/SIGTERM). Encerrando graciosamente...")
 		}
 		log.Info("sinal de encerramento recebido")
+	case <-coordinator.StopRequested():
+		// Não depende do retorno de Start: se o boot estiver travado, esperar
+		// por ele deixaria o processo vivo sem socket.
 	case err := <-coordErrCh:
 		if err != nil {
 			log.Error("daemon encerrou com erro", slog.Any("error", err))
-			return fmt.Errorf("erro durante execução do daemon: %w", err)
+			runErr = fmt.Errorf("erro durante execução do daemon: %w", err)
 		}
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
-
-	if err := coordinator.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("erro durante shutdown: %w", err)
+	// Um encerramento forçado não muda o código de saída: numa parada pedida
+	// pelo usuário, um erro faria o systemd (Restart=on-failure) religar o daemon.
+	if err := shutdownBounded(coordinator); err != nil {
+		log.Error("encerramento forçado", slog.Any("error", err))
+	}
+	if runErr != nil {
+		return runErr
 	}
 
 	if foregroundFlag || isTerminal(os.Stdout) {
 		fmt.Println("✅ WatchFlow encerrado com sucesso.")
 	}
 	return nil
+}
+
+const (
+	shutdownTimeout = 10 * time.Second
+	// shutdownHardLimit cobre o prazo gracioso, a espera extra pelos workers
+	// e o fechamento do IPC e do banco, com folga.
+	shutdownHardLimit = 30 * time.Second
+)
+
+// shutdownBounded desiste de esperar um Shutdown pendurado. Sair assim é
+// seguro para o repositório: os processos git são filhos sem vínculo de
+// término com o daemon e concluem sozinhos, liberando o próprio index.lock, e
+// jobs deixados em RUNNING são retomados pela recuperação do próximo boot.
+func shutdownBounded(c *core.Coordinator) error {
+	return runBounded(shutdownHardLimit, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		return c.Shutdown(ctx)
+	})
+}
+
+// runBounded executa fn e devolve erro se ela não terminar dentro de limit.
+func runBounded(limit time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("encerramento não concluiu em %s; saindo sem esperar", limit)
+	}
 }
 
 // isTerminal informa se o descritor está ligado a um terminal interativo.

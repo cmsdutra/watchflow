@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/watchflow/watchflow/internal/config"
@@ -44,6 +46,22 @@ const (
 	maintenanceInterval = 1 * time.Hour
 )
 
+// Variáveis, e não constantes, para que os testes simulem um registro que
+// trava sem esperar minutos.
+var (
+	// watcherStartTimeout limita o registro de um watcher no boot. Um cofre de
+	// 2331 diretórios registra em ~420 ms; o prazo é folgado para disco frio ou
+	// pasta sob provedor de nuvem, e existe para que um travamento vire falha
+	// visível — que o supervisor reinicia — em vez de um daemon que responde
+	// sem vigiar nada.
+	watcherStartTimeout = 2 * time.Minute
+	// workerExitGrace é a espera extra pelos workers depois que os comandos git
+	// já foram interrompidos. Um worker que não volta nem assim está preso fora
+	// do git, e esperar por ele penduraria o encerramento para sempre.
+	workerExitGrace = 5 * time.Second
+	newWatcher      = watcher.New
+)
+
 // Coordinator é o orquestrador central do daemon, unificando watchers, normalizers,
 // debouncers, fila SQLite, workers de pipeline e o servidor IPC.
 type Coordinator struct {
@@ -72,6 +90,12 @@ type Coordinator struct {
 	version     string
 	log         *slog.Logger
 	notifier    notify.Notifier
+	// ready só vira true quando todos os watchers estão registrados. Antes
+	// disso o IPC já responde, e 'status' não pode apresentar a captura como
+	// saudável.
+	ready         atomic.Bool
+	stopRequested chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewCoordinator instancia o coordenador central, configurando o banco SQLite e preparando o estado.
@@ -159,6 +183,7 @@ func NewCoordinator(cfg *config.Config, appVersion string) (*Coordinator, error)
 		watcherCancels: make(map[string]context.CancelFunc),
 		paused:         make(map[string]bool),
 		lastEnqueue:    make(map[string]time.Time),
+		stopRequested:  make(chan struct{}),
 		version:        appVersion,
 		log:            log,
 		notifier:       notify.New(cfg.Notifications.NotifyOptions()),
@@ -244,8 +269,16 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		if !wCfg.IsEnabled() {
 			continue
 		}
-		if err := c.startWatcher(coordCtx, wCfg); err != nil {
+		c.log.Info("registrando watcher", slog.String("watcher", wCfg.Name))
+		if err := c.startWatcherBounded(coordCtx, wCfg); err != nil {
+			// Parada pedida no meio do boot não é falha.
+			stopped := errors.Is(err, context.Canceled) && coordCtx.Err() != nil
 			cancel()
+			if stopped {
+				return nil
+			}
+			c.log.Error("boot interrompido: watcher não registrado",
+				slog.String("watcher", wCfg.Name), slog.Any("error", err))
 			return err
 		}
 	}
@@ -260,6 +293,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	activeWatchers := len(c.watchers)
 	c.mu.RUnlock()
 
+	c.ready.Store(true)
 	c.log.Info("daemon pronto",
 		slog.String("versao", c.version),
 		slog.Int("watchers", activeWatchers),
@@ -273,6 +307,28 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 }
 
+// startWatcherBounded aplica watcherStartTimeout a startWatcher. A chamada
+// travada não tem como ser interrompida (o registro no sistema de arquivos é
+// síncrono); ela é abandonada, e startWatcher descarta o próprio resultado se
+// terminar depois que o boot já desistiu.
+func (c *Coordinator) startWatcherBounded(ctx context.Context, wCfg config.WatcherConfig) error {
+	done := make(chan error, 1)
+	go func() { done <- c.startWatcher(ctx, wCfg) }()
+
+	timer := time.NewTimer(watcherStartTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("watcher '%s' não terminou de registrar em %s; o daemon vai encerrar para ser reiniciado",
+			wCfg.Name, watcherStartTimeout)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // startWatcher monta a cadeia reativa de um watcher e a inicia sob um contexto
 // próprio, derivado do de captura. Isso permite parar um watcher isoladamente
 // durante uma recarga sem afetar os demais.
@@ -282,7 +338,7 @@ func (c *Coordinator) startWatcher(parent context.Context, wCfg config.WatcherCo
 		targetPath = config.ExpandPath(wCfg.Path)
 	}
 
-	w, err := watcher.New(wCfg.Name, targetPath)
+	w, err := newWatcher(wCfg.Name, targetPath)
 	if err != nil {
 		c.log.Error("falha ao criar watcher",
 			slog.String("watcher", wCfg.Name), slog.String("path", targetPath), slog.Any("error", err))
@@ -301,9 +357,15 @@ func (c *Coordinator) startWatcher(parent context.Context, wCfg config.WatcherCo
 		return fmt.Errorf("falha ao criar debouncer para '%s': %w", wCfg.Name, err)
 	}
 
-	watcherCtx, cancelWatcher := context.WithCancel(parent)
-
 	c.mu.Lock()
+	// Checado sob a trava para não registrar um watcher depois que o
+	// encerramento já fechou os existentes.
+	if err := parent.Err(); err != nil {
+		c.mu.Unlock()
+		_ = w.Close()
+		return err
+	}
+	watcherCtx, cancelWatcher := context.WithCancel(parent)
 	c.watchers[wCfg.Name] = w
 	c.filters[wCfg.Name] = filter
 	c.debouncers[wCfg.Name] = deb
@@ -838,7 +900,13 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 	}
 
 	if !workersFinished {
-		c.workerWg.Wait()
+		graceCtx, cancelGrace := context.WithTimeout(context.Background(), workerExitGrace)
+		finished := waitGroup(graceCtx, &c.workerWg)
+		cancelGrace()
+		if !finished {
+			c.log.Error("workers não retornaram mesmo após a interrupção dos comandos git; encerrando sem eles",
+				slog.Duration("espera", workerExitGrace))
+		}
 	}
 
 	// 6. Jobs interrompidos por ordem de parada não são falha: voltam para
@@ -909,14 +977,25 @@ func (c *Coordinator) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 	runningCount := counts[queue.StatusRunning]
 	blockedCount := counts[queue.StatusBlocked]
 
+	ready := c.ready.Load()
+
 	var dtos []ipc.WatcherStatusDTO
 	for _, w := range watchers {
 		lastEv := formatTimePtr(w.LastEventAt)
 		lastSuccess := formatTimePtr(w.LastSuccessSyncAt)
 		lastFailed := formatTimePtr(w.LastFailedSyncAt)
 
+		// O status persistido descreve a última sincronização, não se há
+		// captura. Sem watcher registrado não há, e dizer HEALTHY esconde
+		// que as alterações do usuário não estão sendo vistas.
 		statusStr := string(w.Status)
-		if c.paused[w.Name] {
+		_, capturing := c.watchers[w.Name]
+		switch {
+		case !capturing && !ready:
+			statusStr = string(queue.WatcherStarting)
+		case !capturing:
+			statusStr = string(queue.WatcherInactive)
+		case c.paused[w.Name]:
 			statusStr = string(queue.WatcherPaused)
 		}
 
@@ -950,6 +1029,7 @@ func (c *Coordinator) Status(ctx context.Context) (*ipc.StatusResponse, error) {
 		PendingJobs: pendingCount,
 		RunningJobs: runningCount,
 		BlockedJobs: blockedCount,
+		Starting:    !ready,
 	}, nil
 }
 
@@ -1343,12 +1423,20 @@ func (c *Coordinator) Resume(ctx context.Context, watcherName string) (*ipc.Acti
 	}, nil
 }
 
+// StopRequested fecha quando 'watchflow stop' é aceito. Existe porque o Stop
+// só cancela o contexto de captura, e quem espera o retorno de Start ficaria
+// preso se Start não voltasse.
+func (c *Coordinator) StopRequested() <-chan struct{} {
+	return c.stopRequested
+}
+
 // Stop responde à solicitação do comando 'watchflow stop'.
 func (c *Coordinator) Stop(ctx context.Context) (*ipc.ActionResponse, error) {
 	c.log.Info("encerramento solicitado via IPC")
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
+		c.stopOnce.Do(func() { close(c.stopRequested) })
 		if c.cancel != nil {
 			c.cancel()
 		}

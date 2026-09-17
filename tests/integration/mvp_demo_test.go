@@ -96,14 +96,15 @@ func TestMVP_FullAutonomousSyncDemonstration(t *testing.T) {
 		_ = coord.Start(daemonCtx)
 	}()
 
-	// Aguarda vinculação do Unix socket
+	// Aguarda o socket e o fim do registro dos watchers: o IPC responde antes
+	// de a captura começar.
 	client := ipc.NewClient(sockPath)
 	var isConnected bool
 	for i := 0; i < 30; i++ {
 		time.Sleep(100 * time.Millisecond)
 		if _, statErr := os.Stat(sockPath); statErr == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			if _, statusErr := client.Status(ctx); statusErr == nil {
+			if resp, statusErr := client.Status(ctx); statusErr == nil && !resp.Starting {
 				isConnected = true
 				cancel()
 				break

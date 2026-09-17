@@ -35,6 +35,9 @@ type StatusResponse struct {
 	PendingJobs int                `json:"pending_jobs"`
 	RunningJobs int                `json:"running_jobs"`
 	BlockedJobs int                `json:"blocked_jobs"`
+	// Starting é true enquanto o boot não registrou todos os watchers. Com
+	// omitempty, um daemon anterior a este campo continua lido como pronto.
+	Starting bool `json:"starting,omitempty"`
 }
 
 // WatcherStatusDTO reflete o estado operacional de um watcher para exibição na CLI.

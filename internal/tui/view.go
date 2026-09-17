@@ -60,6 +60,9 @@ func (m Model) renderHeader() string {
 		right = dimStyle.Render(fmt.Sprintf("PID %d | uptime %s | %d pendente(s) · %d rodando · %d bloqueado(s)",
 			m.status.DaemonPID, m.status.Uptime,
 			m.status.PendingJobs, m.status.RunningJobs, m.status.BlockedJobs))
+		if m.status.Starting {
+			right = warnStyle.Render("INICIANDO — captura ainda não começou") + "  " + right
+		}
 	}
 
 	return left + "  " + right
@@ -322,6 +325,10 @@ func statusBadge(status string) string {
 		return warnStyle.Render("◐ DEGRADED       ")
 	case string(queue.WatcherConflictHalted):
 		return errorStyle.Render("✖ CONFLICT_HALTED")
+	case string(queue.WatcherStarting):
+		return warnStyle.Render("◌ STARTING       ")
+	case string(queue.WatcherInactive):
+		return errorStyle.Render("✖ INACTIVE       ")
 	default:
 		return dimStyle.Render(fmt.Sprintf("%-17s", status))
 	}

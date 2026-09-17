@@ -53,7 +53,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 func renderStatusTable(s *ipc.StatusResponse, sockPath string) {
 	fmt.Printf("\n=== WatchFlow Daemon ===\n")
-	fmt.Printf("Status:       ATIVO (PID: %d)\n", s.DaemonPID)
+	if s.Starting {
+		fmt.Printf("Status:       INICIANDO (PID: %d) — alterações ainda não estão sendo capturadas\n", s.DaemonPID)
+	} else {
+		fmt.Printf("Status:       ATIVO (PID: %d)\n", s.DaemonPID)
+	}
 	fmt.Printf("Versão:       %s\n", s.Version)
 	fmt.Printf("Tempo Ativo:  %s\n", s.Uptime)
 	fmt.Printf("Socket IPC:   %s\n", sockPath)

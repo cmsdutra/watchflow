@@ -127,3 +127,25 @@ pipelines:
 		t.Fatal("runStart não finalizou dentro do tempo limite após comando stop")
 	}
 }
+
+// Um Shutdown pendurado não pode manter o processo vivo sem socket (issue #4).
+func TestRunBoundedGivesUpOnHungFunction(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	start := time.Now()
+	err := runBounded(100*time.Millisecond, func() error {
+		<-release
+		return nil
+	})
+	if err == nil {
+		t.Fatal("esperava erro ao estourar o limite")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("runBounded esperou %s; o limite era 100ms", elapsed)
+	}
+
+	if err := runBounded(time.Second, func() error { return nil }); err != nil {
+		t.Errorf("função que termina no prazo não deveria falhar: %v", err)
+	}
+}

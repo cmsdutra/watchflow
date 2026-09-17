@@ -32,6 +32,15 @@ const (
 	WatcherPaused WatcherStatus = "PAUSED"
 	// WatcherConflictHalted indica interrupção obrigatória por conflito de merge Git.
 	WatcherConflictHalted WatcherStatus = "CONFLICT_HALTED"
+
+	// Os dois abaixo nunca são persistidos: o coordenador os deriva na hora
+	// de responder 'status', quando não há captura ativa para o watcher.
+
+	// WatcherStarting indica que o daemon ainda não terminou de registrar o watcher.
+	WatcherStarting WatcherStatus = "STARTING"
+	// WatcherInactive indica um watcher sem captura com o daemon já de pé
+	// (desabilitado, ou que falhou ao reiniciar numa recarga).
+	WatcherInactive WatcherStatus = "INACTIVE"
 )
 
 // Job representa uma unidade persistida de trabalho a ser executada pelo Pipeline Engine.
