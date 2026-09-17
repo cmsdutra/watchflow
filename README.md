@@ -305,20 +305,22 @@ watchflow doctor
 
 Ele verifica se o Git está instalado, se os limites do kernel para monitoramento
 de arquivos são suficientes para o tamanho da sua pasta, se os diretórios de
-trabalho estão acessíveis e se o serviço systemd está saudável. Se algo estiver
-errado, ele diz o que fazer.
+trabalho estão acessíveis e se o serviço está saudável — a unit do systemd no
+Linux, a tarefa do Agendador no Windows. Se algo estiver errado, ele diz o que
+fazer.
 
 Duas checagens merecem atenção porque cobrem falhas que **não aparecem no log**:
 
 - **Serviço.** Um daemon iniciado à mão no terminal morre junto com a janela, sem
-  deixar registro. Se o `doctor` avisar que a unidade não está instalada, ou que
-  está em loop de reinício, é esse o problema — e o log não vai te contar.
+  deixar registro. Se o `doctor` avisar que a unidade (ou, no Windows, a tarefa
+  do Agendador) não está registrada, ou que está em loop de reinício, é esse o
+  problema — e o log não vai te contar.
 - **Merge drivers.** Se o `.gitattributes` do cofre nomeia um driver que este
   clone não define, o `doctor` avisa antes do primeiro conflito. Veja
   [Arquivos que conflitam sempre](#arquivos-que-conflitam-sempre).
 
-O problema mais comum é o limite de arquivos monitorados. Se o `doctor`
-reclamar disso:
+No Linux, o problema mais comum é o limite de arquivos monitorados (o Windows
+não tem esse limite). Se o `doctor` reclamar disso:
 
 ```bash
 echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
@@ -355,7 +357,7 @@ version: 1
 
 daemon:
   state_dir: "~/.local/state/watchflow"
-  socket_path: "/run/user/${UID}/watchflow.sock"
+  socket_path: "/run/user/${UID}/watchflow.sock"   # ignorado no Windows (ver abaixo)
   log_level: "info"
   max_concurrent_pipelines: 2
 
@@ -392,6 +394,10 @@ pipelines:
       - action: "git.safe_sync"
       - action: "git.push"
 ```
+
+No Windows, um `socket_path` que use `${UID}` é ignorado, porque lá não existe
+UID. O socket vai para dentro do `state_dir`, e é isso que permite usar o mesmo
+arquivo nas duas plataformas.
 
 Dois campos merecem explicação, porque o nome sugere mais do que fazem:
 
@@ -438,8 +444,9 @@ alterado e o daemon segue com a anterior.
 Mudanças na seção `daemon` (socket, diretório de estado, concorrência, nível de
 log) exigem reiniciar de fato — o `reload` avisa quando for o caso:
 
-```
-systemctl --user restart watchflow
+```bash
+systemctl --user restart watchflow                  # Linux
+watchflow stop; watchflow start --detach            # Windows
 ```
 
 ### Ações disponíveis nos pipelines
@@ -462,12 +469,19 @@ comandos existem quando você precisa.
 ### Iniciar e parar
 
 ```bash
-watchflow start     # inicia (fica ocupando o terminal)
-watchflow stop      # encerra de forma limpa
+watchflow start           # inicia (fica ocupando o terminal)
+watchflow start --detach  # Windows: inicia em segundo plano
+watchflow stop            # encerra de forma limpa
 ```
 
+No dia a dia você não precisa de nenhum dos dois: o serviço sobe o daemon
+sozinho. No Windows, lembre que sem `--detach` fechar o terminal mata o daemon.
+
 O encerramento é ordenado: ele para de captar mudanças novas, deixa terminar o
-que estava em andamento e devolve para a fila o que sobrou.
+que estava em andamento e devolve para a fila o que sobrou. Se algo travar
+nesse processo, ele desiste depois de 30 segundos e sai mesmo assim. Um `git`
+em andamento não é interrompido por isso e termina sozinho, e o trabalho que
+ficou pela metade é retomado na próxima vez que o daemon subir.
 
 ### Ver o que está acontecendo
 
@@ -517,6 +531,10 @@ processadas quando você retomar. Nada é descartado.
 ---
 
 ## Rodando como serviço
+
+Esta seção é do Linux. No Windows o `install.ps1` já registra a tarefa do
+Agendador, que sobe o daemon no logon e o reergue se ele cair — veja
+[No Windows](#no-windows).
 
 Se você usou `./install.sh`, isso já foi feito — o script instala a unit do
 systemd. Para habilitar:
@@ -647,11 +665,21 @@ Os estados possíveis de uma pasta:
 | `DEGRADED` | Falhas temporárias, tentando de novo (rede fora, por exemplo) |
 | `PAUSED` | Você pausou |
 | `CONFLICT_HALTED` | Parado esperando você resolver um conflito |
+| `STARTING` | O daemon acabou de subir e ainda não começou a vigiar a pasta |
+| `INACTIVE` | O daemon está de pé, mas a pasta não está sendo vigiada (desabilitada, ou falhou ao reiniciar num `reload`) |
+
+Enquanto alguma pasta estiver em `STARTING`, o `status` mostra o daemon como
+`INICIANDO` em vez de `ATIVO`. Isso costuma levar menos de um segundo. Se o
+registro de uma pasta passar de 2 minutos, o daemon encerra com erro para que o
+serviço o suba de novo, em vez de ficar de pé sem vigiar nada. Se isso se
+repetir, procure `boot interrompido` no log: a linha `registrando watcher`
+imediatamente anterior mostra qual pasta travou.
 
 ### Erros ficam guardados onde?
 
-Em `~/.local/state/watchflow/watchflow.log`, no formato JSON, com rotação
-automática. O comando `watchflow logs` lê esse arquivo — e funciona mesmo com o
+Em `~/.local/state/watchflow/watchflow.log` (no Windows,
+`%USERPROFILE%\.local\state\watchflow\watchflow.log`), no formato JSON, com
+rotação automática. O comando `watchflow logs` lê esse arquivo — e funciona mesmo com o
 programa parado, o que ajuda a investigar por que ele parou.
 
 ---
